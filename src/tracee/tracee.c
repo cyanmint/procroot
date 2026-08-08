@@ -25,6 +25,7 @@
 #include <stdlib.h>     /* NULL, */
 #include <assert.h>     /* assert(3), */
 #include <string.h>     /* bzero(3), */
+#include <strings.h>    /* bzero(3), */
 #include <stdbool.h>    /* bool, true, false, */
 #include <sys/queue.h>  /* LIST_*,  */
 #include <talloc.h>     /* talloc_*, */

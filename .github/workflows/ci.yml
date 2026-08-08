@@ -50,6 +50,11 @@ jobs:
     # Android binaries) with libtalloc statically embedded into each
     # program instead of relying on a shared libtalloc.so.
     #
+    # libtalloc itself is not built from source here: the prebuilt
+    # libtalloc-static package from the Termux repository is fetched
+    # and used directly, since Termux already builds it for Android/bionic
+    # with an ABI compatible with NDK-built binaries.
+    #
     # This job only verifies that the cross-compiled binaries link
     # successfully; it cannot execute Android/bionic binaries on the
     # (x86_64 Linux/glibc) GitHub-hosted runner.
@@ -61,7 +66,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl qemu-user-static
+          sudo apt-get install -y build-essential curl
 
       - name: Set up Android NDK
         id: setup-ndk
@@ -70,35 +75,31 @@ jobs:
           ndk-version: r26d
           add-to-path: false
 
-      - name: Cross-compile a static libtalloc.a for Android
+      - name: Fetch prebuilt libtalloc-static from Termux
         env:
-          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          TARGET: aarch64-linux-android24
+          TERMUX_ARCH: aarch64
+          TALLOC_VERSION: 2.4.3
         run: |
           set -e
-          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
-          export CC="$TOOLCHAIN/bin/${TARGET}-clang"
-          export AR="$TOOLCHAIN/bin/llvm-ar"
-          export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+          mkdir -p "$GITHUB_WORKSPACE/android-libs/lib" "$GITHUB_WORKSPACE/android-libs/include" /tmp/termux-talloc
+          cd /tmp/termux-talloc
 
-          curl -fsSL -o /tmp/talloc.tar.gz \
-            https://www.samba.org/ftp/talloc/talloc-2.4.2.tar.gz
-          mkdir -p /tmp/talloc-src
-          tar -xzf /tmp/talloc.tar.gz -C /tmp/talloc-src --strip-components=1
+          curl -fsSL -o libtalloc-static.deb \
+            "https://packages.termux.dev/apt/termux-main/pool/main/libt/libtalloc-static/libtalloc-static_${TALLOC_VERSION}_${TERMUX_ARCH}.deb"
+          curl -fsSL -o libtalloc.deb \
+            "https://packages.termux.dev/apt/termux-main/pool/main/libt/libtalloc/libtalloc_${TALLOC_VERSION}_${TERMUX_ARCH}.deb"
 
-          cd /tmp/talloc-src
-          ./configure \
-            --disable-python \
-            --cross-compile \
-            --cross-execute="qemu-aarch64-static -L $TOOLCHAIN/sysroot"
-          make bin/default/libtalloc.a || make
-
-          # The exact output path varies with the waf layout; locate the
-          # built static library and stage it where the main build can
-          # find it.
-          mkdir -p "$GITHUB_WORKSPACE/android-libs/lib" "$GITHUB_WORKSPACE/android-libs/include"
+          ar x libtalloc-static.deb
+          tar -xJf data.tar.xz
           find . -name 'libtalloc.a' -exec cp {} "$GITHUB_WORKSPACE/android-libs/lib/" \;
-          cp talloc.h "$GITHUB_WORKSPACE/android-libs/include/"
+
+          rm -rf data.tar.xz data
+          ar x libtalloc.deb
+          tar -xJf data.tar.xz
+          find . -name 'talloc.h' -exec cp {} "$GITHUB_WORKSPACE/android-libs/include/" \;
+
+          test -f "$GITHUB_WORKSPACE/android-libs/lib/libtalloc.a"
+          test -f "$GITHUB_WORKSPACE/android-libs/include/talloc.h"
 
       - name: Build procroot and checker for Android (dynamic, static libtalloc)
         env:
@@ -112,9 +113,20 @@ jobs:
           # libtalloc is linked statically (its .a is given directly to
           # the linker); everything else (libc, libdl, ...) stays the
           # normal Android dynamic linking.
+          #
+          # CPPFLAGS and STRIP/OBJCOPY/OBJDUMP are set on the make
+          # command line here, which overrides (rather than appends to)
+          # src/GNUmakefile's own "+=" defaults, so the usual
+          # defines/include paths must be repeated explicitly, and the
+          # toolchain's llvm-* binutils must be used since the host's
+          # GNU binutils cannot handle the loader's Android/aarch64
+          # ELF output (strip/objdump misidentify or reject it).
           make -C src -j"$(nproc)" \
             CC="$CC" \
-            CPPFLAGS="-I$GITHUB_WORKSPACE/android-libs/include" \
+            STRIP="$TOOLCHAIN/bin/llvm-strip" \
+            OBJCOPY="$TOOLCHAIN/bin/llvm-objcopy" \
+            OBJDUMP="$TOOLCHAIN/bin/llvm-objdump" \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I. -I$GITHUB_WORKSPACE/android-libs/include" \
             LDFLAGS="$GITHUB_WORKSPACE/android-libs/lib/libtalloc.a -Wl,-z,noexecstack"
 
           make -C tests/checker \

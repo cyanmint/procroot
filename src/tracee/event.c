@@ -29,6 +29,7 @@
 #include <signal.h>     /* signal(2), SIG_DFL, */
 #include <unistd.h>     /* fork(2), chdir(2), getpid(2), */
 #include <string.h>     /* strcmp(3), */
+#include <strings.h>    /* bzero(3), */
 #include <errno.h>      /* errno(3), */
 #include <stdbool.h>    /* bool, true, false, */
 #include <assert.h>     /* assert(3), */

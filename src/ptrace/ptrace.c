@@ -29,6 +29,7 @@
 #include <sys/param.h>  /* MIN(), MAX(), */
 #include <sys/wait.h>   /* __WALL, */
 #include <string.h>     /* memcpy(3), */
+#include <strings.h>    /* bzero(3), */
 
 #include "ptrace/ptrace.h"
 #include "ptrace/user.h"
