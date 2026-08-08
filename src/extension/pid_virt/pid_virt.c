@@ -27,12 +27,14 @@
 #include <errno.h>       /* E*, */
 #include <ctype.h>       /* isdigit(3), */
 #include <inttypes.h>    /* PRIu64, */
+#include <fcntl.h>       /* O_*, AT_FDCWD, */
 #include <linux/sched.h> /* CLONE_*, */
 
 #include "extension/extension.h"
 #include "extension/pid_virt/pid_virt.h"
 #include "syscall/syscall.h"
 #include "syscall/sysnum.h"
+#include "syscall/chain.h"
 #include "tracee/tracee.h"
 #include "tracee/reg.h"
 #include "tracee/mem.h"
@@ -158,6 +160,20 @@ typedef struct {
 	 * readlink(2) target is a host PID (and, for thread-self, a
 	 * host TID) that must be patched back to the vPID/vTID.  */
 	bool last_path_is_self;
+
+	/* Set right after an open(at)(2) targeting "/sys" (or a
+	 * non-PID "/proc" entry) that failed at open() time was
+	 * transparently redirected to a fake, always-openable file;
+	 * consumed by the SYSCALL_CHAINED_EXIT handler to finish the
+	 * fd-tracking spoofing.  */
+	bool open_redirect_pending;
+
+	/* Address, in the tracee's memory, of a pre-written
+	 * FAKE_OPEN_TARGET path, reserved at sysenter (see
+	 * prepare_open_redirect_target()) for a possible open() failure
+	 * spoofing at sysexit; 0 if none was reserved for the current
+	 * syscall.  */
+	word_t open_redirect_target_addr;
 } Config;
 
 /**
@@ -667,6 +683,76 @@ out2:
 	TALLOC_FREE(outbuf);
 }
 
+/* Always-openable stand-in used to spoof open(2)/openat(2) failures
+ * against "/sys" (and non-PID "/proc" entries).  */
+#define FAKE_OPEN_TARGET "/dev/null"
+
+/**
+ * Reserve space in @tracee's memory (sysenter stack only, see
+ * alloc_mem()) for FAKE_OPEN_TARGET and remember its address in
+ * @config, so that redirect_failed_sys_open() can use it later, at
+ * sysexit, without itself needing to touch the stack (alloc_mem()
+ * requires sysenter).  Called for every open(2)/openat(2) targeting
+ * "/sys" (or a non-PID "/proc" entry), regardless of whether the real
+ * call will actually fail.
+ */
+static void prepare_open_redirect_target(Tracee *tracee, Config *config)
+{
+	word_t addr;
+
+	config->open_redirect_target_addr = 0;
+
+	addr = alloc_mem(tracee, sizeof(FAKE_OPEN_TARGET));
+	if (addr == 0)
+		return;
+
+	if (write_data(tracee, addr, FAKE_OPEN_TARGET, sizeof(FAKE_OPEN_TARGET)) < 0)
+		return;
+
+	config->open_redirect_target_addr = addr;
+}
+
+/**
+ * An open(at)(2) targeting "/sys" (or a non-PID "/proc" entry) that
+ * fails at open() time itself -- e.g. lacking real host privileges to
+ * open a cpufreq governor or a cgroup control file for writing --
+ * can't be spoofed to success by merely rewriting the result: unlike
+ * write()/ioctl() failures on an already-open fd, there is no fd to
+ * later fake writes/ioctls on.  So instead transparently redirect the
+ * whole syscall to FAKE_OPEN_TARGET, an always-openable file, letting
+ * the guest get a valid fd it can freely read/write/ioctl on (those
+ * are, in turn, spoofed to success too when they fail).
+ */
+static void redirect_failed_sys_open(Tracee *tracee, Config *config, Sysnum sysnum)
+{
+	Reg flags_reg;
+	word_t flags;
+	word_t target_addr;
+	int status;
+
+	target_addr = config->open_redirect_target_addr;
+	config->open_redirect_target_addr = 0;
+	if (target_addr == 0)
+		return;
+
+	flags_reg = (sysnum == PR_openat) ? SYSARG_3 : SYSARG_2;
+	flags = peek_reg(tracee, ORIGINAL, flags_reg);
+
+	/* Only the access-mode bits (and harmless flags like
+	 * O_CLOEXEC/O_NONBLOCK) still matter once redirected: creation,
+	 * truncation, exclusivity, or directory-only flags would be
+	 * meaningless -- or outright rejected -- against a character
+	 * device.  */
+	flags &= ~(word_t) (O_CREAT | O_EXCL | O_TRUNC | O_DIRECTORY | O_NOCTTY);
+
+	status = register_chained_syscall(tracee, PR_openat,
+					AT_FDCWD, target_addr, flags, 0, 0, 0);
+	if (status < 0)
+		return;
+
+	config->open_redirect_pending = true;
+}
+
 static void handle_openat_exit(Tracee *tracee, Config *config)
 {
 	int64_t result;
@@ -675,8 +761,12 @@ static void handle_openat_exit(Tracee *tracee, Config *config)
 	result = (int64_t) peek_reg(tracee, CURRENT, SYSARG_RESULT);
 
 	if (config->last_path_is_sys) {
-		if (result >= 0)
+		if (result >= 0) {
 			track_fd(config, (int) result, 0, SYS_FD_GENERIC);
+			return;
+		}
+
+		redirect_failed_sys_open(tracee, config, get_sysnum(tracee, ORIGINAL));
 		return;
 	}
 
@@ -1021,11 +1111,42 @@ int pid_virt_callback(Extension *extension, ExtensionEvent event,
 		return handle_sysenter(tracee);
 	}
 
+	case SYSCALL_ENTER_END: {
+		Tracee *tracee = TRACEE(extension);
+		Config *config = talloc_get_type_abort(extension->config, Config);
+		Sysnum sysnum = get_sysnum(tracee, ORIGINAL);
+
+		/* By now the GUEST_PATH handler (invoked from within
+		 * translate_syscall_enter()) has already resolved this
+		 * syscall's path, so config->last_path_is_sys reflects
+		 * whether it targets "/sys"/non-PID "/proc".  Reserve
+		 * the fake open() target now, while still in sysenter,
+		 * for possible use at sysexit.  */
+		if ((sysnum == PR_open || sysnum == PR_openat) && config->last_path_is_sys)
+			prepare_open_redirect_target(tracee, config);
+
+		return 0;
+	}
+
 	case SYSCALL_EXIT_END: {
 		Tracee *tracee = TRACEE(extension);
 		Config *config = talloc_get_type_abort(extension->config, Config);
 
 		handle_sysexit(tracee, config);
+		return 0;
+	}
+
+	case SYSCALL_CHAINED_EXIT: {
+		Tracee *tracee = TRACEE(extension);
+		Config *config = talloc_get_type_abort(extension->config, Config);
+
+		if (config->open_redirect_pending) {
+			int64_t result = (int64_t) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+
+			config->open_redirect_pending = false;
+			if (result >= 0)
+				track_fd(config, (int) result, 0, SYS_FD_GENERIC);
+		}
 		return 0;
 	}
 
