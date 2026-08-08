@@ -135,3 +135,8 @@ jobs:
       - name: Verify Android binaries
         run: |
           file src/procroot tests/checker/checker
+          
+      - name: upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: src/procroot
