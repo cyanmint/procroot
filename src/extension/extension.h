@@ -209,5 +209,7 @@ extern int fix_symlink_size_callback(Extension *extension, ExtensionEvent event,
 extern int ashmem_memfd_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
 #endif /* defined(__ANDROID__) || defined(__BIONIC__) */
 extern int mountinfo_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
+extern int pid_virt_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
+extern bool pid_virt_binding_conflicts(Tracee *tracee);
 
 #endif /* EXTENSION_H */

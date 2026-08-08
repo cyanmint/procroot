@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libtalloc-dev \
+            gcc-multilib \
+            libc6-dev-i386 \
+            pkg-config
+
+      - name: Build procroot (statically linked)
+        run: |
+          make -C src -j"$(nproc)" LDFLAGS="-static -ltalloc -Wl,-z,noexecstack"
+
+      - name: Build checker (statically linked)
+        run: |
+          make -C tests/checker static
+
+      - name: Verify binaries are statically linked
+        run: |
+          file src/procroot tests/checker/checker
+          ldd src/procroot 2>&1 | grep -q "not a dynamic executable"
+          ldd tests/checker/checker 2>&1 | grep -q "not a dynamic executable"
+
+      - name: Run PID/proc/sys virtualization checker under procroot -p
+        run: |
+          ./src/procroot -p ./tests/checker/checker
+
+  build-android-ndk:
+    # Cross-compiles procroot and the checker against the Android NDK
+    # (dynamically linked against Android's bionic libc, as normal for
+    # Android binaries) with libtalloc statically embedded into each
+    # program instead of relying on a shared libtalloc.so.
+    #
+    # This job only verifies that the cross-compiled binaries link
+    # successfully; it cannot execute Android/bionic binaries on the
+    # (x86_64 Linux/glibc) GitHub-hosted runner.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl qemu-user-static
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Cross-compile a static libtalloc.a for Android
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          TARGET: aarch64-linux-android24
+        run: |
+          set -e
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          export CC="$TOOLCHAIN/bin/${TARGET}-clang"
+          export AR="$TOOLCHAIN/bin/llvm-ar"
+          export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+
+          curl -fsSL -o /tmp/talloc.tar.gz \
+            https://www.samba.org/ftp/talloc/talloc-2.4.2.tar.gz
+          mkdir -p /tmp/talloc-src
+          tar -xzf /tmp/talloc.tar.gz -C /tmp/talloc-src --strip-components=1
+
+          cd /tmp/talloc-src
+          ./configure \
+            --disable-python \
+            --cross-compile \
+            --cross-execute="qemu-aarch64-static -L $TOOLCHAIN/sysroot"
+          make bin/default/libtalloc.a || make
+
+          # The exact output path varies with the waf layout; locate the
+          # built static library and stage it where the main build can
+          # find it.
+          mkdir -p "$GITHUB_WORKSPACE/android-libs/lib" "$GITHUB_WORKSPACE/android-libs/include"
+          find . -name 'libtalloc.a' -exec cp {} "$GITHUB_WORKSPACE/android-libs/lib/" \;
+          cp talloc.h "$GITHUB_WORKSPACE/android-libs/include/"
+
+      - name: Build procroot and checker for Android (dynamic, static libtalloc)
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          TARGET: aarch64-linux-android24
+        run: |
+          set -e
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          export CC="$TOOLCHAIN/bin/${TARGET}-clang"
+
+          # libtalloc is linked statically (its .a is given directly to
+          # the linker); everything else (libc, libdl, ...) stays the
+          # normal Android dynamic linking.
+          make -C src -j"$(nproc)" \
+            CC="$CC" \
+            CPPFLAGS="-I$GITHUB_WORKSPACE/android-libs/include" \
+            LDFLAGS="$GITHUB_WORKSPACE/android-libs/lib/libtalloc.a -Wl,-z,noexecstack"
+
+          make -C tests/checker \
+            CC="$CC"
+
+      - name: Verify Android binaries
+        run: |
+          file src/procroot tests/checker/checker

@@ -83,6 +83,7 @@ OBJECTS += \
 	extension/hidden_files/hidden_files.o \
 	extension/mountinfo/mountinfo.o \
 	extension/port_switch/port_switch.o \
+	extension/pid_virt/pid_virt.o \
 	extension/sysvipc/sysvipc.o \
 	extension/sysvipc/sysvipc_msg.o \
 	extension/sysvipc/sysvipc_sem.o \
@@ -99,9 +100,9 @@ $(eval $(call define_from_arch.h,,HAS_POKEDATA_WORKAROUND))
 
 ifdef PROOT_UNBUNDLE_LOADER
   CFLAGS += "-DPROOT_UNBUNDLE_LOADER=\"$(PROOT_UNBUNDLE_LOADER)\""
-proot: | loader/loader
+procroot: | loader/loader
 ifdef HAS_LOADER_32BIT
-proot: | loader/loader-m32
+procroot: | loader/loader-m32
 endif
 else
   OBJECTS += loader/loader-wrapped.o
@@ -114,8 +115,8 @@ ifdef HAS_POKEDATA_WORKAROUND
   OBJECTS += loader/loader-info.o
 endif
 
-.DEFAULT_GOAL = proot
-all: proot
+.DEFAULT_GOAL = procroot
+all: procroot
 
 ######################################################################
 # Beautified output
@@ -189,7 +190,7 @@ OBJIFY = $($(quiet)GEN)									\
 				grep architecture | cut -f 1 -d , | awk '{print $$2}'`	\
 		$< $@
 
-proot: $(OBJECTS)
+procroot: $(OBJECTS)
 	$(LINK)
 
 # Special case to compute which files depend on the auto-generated
@@ -262,9 +263,9 @@ BINDIR ?= $(PREFIX)/bin
 
 .PHONY: clean distclean install uninstall
 clean distclean:
-	-$(RM) -f $(CHECK_OBJECTS) $(CHECK_PROGRAMS) $(CHECK_RESULTS) $(OBJECTS) $(LOADER_OBJECTS) $(LOADER-m32_OBJECTS) proot loader/loader loader/loader-m32 $(DEPS) build.h licenses
+	-$(RM) -f $(CHECK_OBJECTS) $(CHECK_PROGRAMS) $(CHECK_RESULTS) $(OBJECTS) $(LOADER_OBJECTS) $(LOADER-m32_OBJECTS) procroot loader/loader loader/loader-m32 $(DEPS) build.h licenses
 
-install: proot
+install: procroot
 	$($(quiet)INSTALL) -D $< $(DESTDIR)$(BINDIR)/$<
 ifdef PROOT_UNBUNDLE_LOADER
 	$(INSTALL) -D loader/loader $(PROOT_UNBUNDLE_LOADER)/loader
@@ -274,7 +275,7 @@ endif
 endif
 
 uninstall:
-	-$(RM) -f $(DESTDIR)$(BINDIR)/proot
+	-$(RM) -f $(DESTDIR)$(BINDIR)/procroot
 ifdef PROOT_UNBUNDLE_LOADER
 	$(INSTALL) -D loader/loader $(PROOT_UNBUNDLE_LOADER)/loader
 ifdef HAS_LOADER_32BIT
