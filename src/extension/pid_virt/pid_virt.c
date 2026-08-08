@@ -706,6 +706,11 @@ static void prepare_open_redirect_target(Tracee *tracee, Config *config)
 	if (addr == 0)
 		return;
 
+	/* If this fails, config->open_redirect_target_addr stays 0 (no
+	 * redirect attempted for this syscall); the sysenter-reserved
+	 * stack space itself is automatically reclaimed when the
+	 * tracee's original registers are restored at the end of the
+	 * sysexit stage, so nothing is leaked.  */
 	if (write_data(tracee, addr, FAKE_OPEN_TARGET, sizeof(FAKE_OPEN_TARGET)) < 0)
 		return;
 
