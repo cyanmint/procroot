@@ -40,9 +40,9 @@ jobs:
           ldd src/procroot 2>&1 | grep -q "not a dynamic executable"
           ldd tests/checker/checker 2>&1 | grep -q "not a dynamic executable"
 
-      - name: Run PID/proc/sys virtualization checker under procroot -p
+      - name: Run PID/proc/sys virtualization checker under procroot -N
         run: |
-          ./src/procroot -p ./tests/checker/checker
+          ./src/procroot -N ./tests/checker/checker
 
   build-android-ndk:
     # Cross-compiles procroot and the checker against the Android NDK

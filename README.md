@@ -18,10 +18,10 @@ binary/output rename: source file names (e.g. `cli/proot.c`,
 the codebase and documentation are intentionally left unchanged, since
 this remains a fork of the upstream PRoot project.
 
-New feature: `-p` / `--proc`, user-space PID namespace virtualization
+New feature: `-N` / `--proc`, user-space PID namespace virtualization
 ----------------------------------------------------------------------
 
-`procroot` supports a new CLI switch, `-p` / `--proc`, which emulates a
+`procroot` supports a new CLI switch, `-N` / `--proc`, which emulates a
 PID namespace entirely in user-space (no root/`CAP_SYS_ADMIN`/real
 `unshare(CLONE_NEWPID)` required):
 
@@ -55,7 +55,7 @@ PID namespace entirely in user-space (no root/`CAP_SYS_ADMIN`/real
   host (e.g. a permission-denied write to a sysfs attribute) is turned
   into an apparent successful no-op on the guest side, instead of
   surfacing the real failure.
-* `-p`/`--proc` is mutually exclusive with binding the host `/proc` or
+* `-N`/`--proc` is mutually exclusive with binding the host `/proc` or
   `/sys` (`-b /proc`, `-b /sys`, or any equivalent `--bind=`): PID
   virtualization replaces standard `/proc`/`/sys` bind mounting, and
   combining them is rejected with a `FATAL` error at startup.
@@ -66,7 +66,7 @@ A standalone checker program that exercises these behaviors lives in
 ```sh
 make -C src
 make -C tests/checker
-./src/procroot -p ./tests/checker/checker
+./src/procroot -N ./tests/checker/checker
 ```
 
 It is also built and run automatically in CI (see

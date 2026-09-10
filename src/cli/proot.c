@@ -78,7 +78,7 @@ static int handle_option_b(Tracee *tracee, const Cli *cli UNUSED, const char *va
 	if (strcmp(trimmed, "/proc") == 0
 	    && get_extension(tracee, pid_virt_callback) != NULL) {
 		note(tracee, ERROR, USER,
-			"-p/--proc cannot be used together with -b /proc. "
+			"-N/--proc cannot be used together with -b /proc. "
 			"PID virtualization replaces standard /proc bind mounting.");
 		return -1;
 	}
@@ -86,7 +86,7 @@ static int handle_option_b(Tracee *tracee, const Cli *cli UNUSED, const char *va
 	if (strcmp(trimmed, "/sys") == 0
 	    && get_extension(tracee, pid_virt_callback) != NULL) {
 		note(tracee, ERROR, USER,
-			"-p/--proc cannot be used together with -b /sys. "
+			"-N/--proc cannot be used together with -b /sys. "
 			"Sysfs virtualization replaces standard /sys bind mounting.");
 		return -1;
 	}
@@ -368,7 +368,7 @@ static int handle_option_proc(Tracee *tracee, const Cli *cli UNUSED, const char 
 
 	if (pid_virt_binding_conflicts(tracee)) {
 		note(tracee, ERROR, USER,
-			"-p/--proc cannot be used together with -b /proc or -b /sys. "
+			"-N/--proc cannot be used together with -b /proc or -b /sys. "
 			"PID/sysfs virtualization replaces standard bind mounting for "
 			"those paths.");
 		return -1;

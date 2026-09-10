@@ -1,7 +1,7 @@
 /* checker: a small self-contained diagnostic program that exercises
- * PRoot's "-p"/"--proc" PID-namespace virtualization (vPID/vTID
+ * PRoot's "-N"/"--proc" PID-namespace virtualization (vPID/vTID
  * translation, "/proc" and "/sys" spoofing).  It has no dependency on
- * PRoot itself: it is meant to be run *under* "proot -p" and simply
+ * PRoot itself: it is meant to be run *under* "proot -N" and simply
  * prints "PASS"/"FAIL" for each individual check, then a final
  * summary.  Exit status is 0 if every check passed, 1 otherwise.
  *
@@ -287,7 +287,7 @@ static void check_sys_write_spoof(void)
 
 	/* /sys/kernel/profiling is root-only to write; as a
 	 * non-privileged user the write(2) normally fails with
-	 * EACCES/EPERM once opened.  Under "-p" this failure must be
+	 * EACCES/EPERM once opened.  Under "-N" this failure must be
 	 * spoofed into an apparent success instead of surfacing the
 	 * real error, so that guest software doesn't get confused by
 	 * unexpected sysfs write failures.  If the file cannot even
@@ -385,7 +385,7 @@ static void check_fork_child_vpid(void)
 
 int main(void)
 {
-	printf("=== PRoot PID-namespace ('-p'/'--proc') checker ===\n");
+	printf("=== PRoot PID-namespace ('-N'/'--proc') checker ===\n");
 
 	check_getpid_is_1();
 	check_proc_self_status();

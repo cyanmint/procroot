@@ -284,7 +284,7 @@ Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
         },
         { .class = "Extension options",
           .arguments = {
-                { .name = "-p", .separator = '\0', .value = NULL },
+                { .name = "-N", .separator = '\0', .value = NULL },
                 { .name = "--proc", .separator = '\0', .value = NULL },
                 { .name = NULL, .separator = '\0', .value = NULL } },
           .handler = handle_option_proc,

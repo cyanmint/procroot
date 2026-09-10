@@ -1,4 +1,4 @@
-# Standalone build for the "-p"/"--proc" PID-namespace virtualization
+# Standalone build for the "-N"/"--proc" PID-namespace virtualization
 # checker.  It has no dependency on PRoot's own build system: it is a
 # single self-contained C program meant to be run *under* PRoot.
 #

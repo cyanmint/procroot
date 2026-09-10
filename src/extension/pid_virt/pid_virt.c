@@ -2,7 +2,7 @@
  *
  * This file is part of PRoot.
  *
- * User-space PID namespace virtualization, enabled with "-p" /
+ * User-space PID namespace virtualization, enabled with "-N" /
  * "--proc".  The initial guest process always appears as vPID 1 and
  * every other guest process/thread gets a small, sequential vPID
  * allocated in creation order (see @Tracee::vpid in tracee/tracee.c).
@@ -178,7 +178,7 @@ typedef struct {
 
 /**
  * Return true if a pending binding targets the host "/proc" or
- * "/sys" directory, which conflicts with "-p"/"--proc" (PID/sysfs
+ * "/sys" directory, which conflicts with "-N"/"--proc" (PID/sysfs
  * virtualization replaces standard bind-mounting for both).
  */
 bool pid_virt_binding_conflicts(Tracee *tracee)
@@ -351,7 +351,7 @@ done:
 /**
  * Mirror a guest path targeting "/sys" directly onto the host "/sys"
  * (no component translation is needed there, unlike "/proc"), always
- * bypassing PRoot's normal binding/canonicalization so that "-p"
+ * bypassing PRoot's normal binding/canonicalization so that "-N"
  * transparently mirrors the host sysfs tree.  Returns 1 if @full is
  * a /sys path (@result is filled in), 0 otherwise.
  */
