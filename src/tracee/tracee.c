@@ -24,7 +24,8 @@
 #include <sys/types.h>  /* pid_t, size_t, */
 #include <stdlib.h>     /* NULL, */
 #include <assert.h>     /* assert(3), */
-#include <string.h>     /* bzero(3), */
+#include <string.h>     /* memcpy(3), */
+#include <strings.h>    /* bzero(3), */
 #include <stdbool.h>    /* bool, true, false, */
 #include <sys/queue.h>  /* LIST_*,  */
 #include <talloc.h>     /* talloc_*, */
@@ -339,6 +340,22 @@ Tracee *get_tracee(const Tracee *current_tracee, pid_t pid, bool create)
 	}
 
 	return (create ? new_tracee(pid) : NULL);
+}
+
+/**
+ * Return the tracee whose virtual PID (see @vpid) equals @vpid, or
+ * NULL if none is currently known.
+ */
+Tracee *get_tracee_by_vpid(uint64_t vpid)
+{
+	Tracee *tracee;
+
+	LIST_FOREACH(tracee, &tracees, link) {
+		if (tracee->vpid == vpid)
+			return tracee;
+	}
+
+	return NULL;
 }
 
 /**

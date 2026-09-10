@@ -53,6 +53,8 @@ static int handle_option_b(Tracee *tracee, const Cli *cli UNUSED, const char *va
 {
 	char *host;
 	char *guest;
+	char *trimmed;
+	size_t length;
 
 	host = talloc_strdup(tracee->ctx, value);
 	if (host == NULL) {
@@ -64,6 +66,29 @@ static int handle_option_b(Tracee *tracee, const Cli *cli UNUSED, const char *va
 	if (guest != NULL) {
 		*guest = '\0';
 		guest++;
+	}
+
+	trimmed = host;
+	length = strlen(trimmed);
+	while (length > 1 && trimmed[length - 1] == '/') {
+		trimmed[length - 1] = '\0';
+		length--;
+	}
+
+	if (strcmp(trimmed, "/proc") == 0
+	    && get_extension(tracee, pid_virt_callback) != NULL) {
+		note(tracee, ERROR, USER,
+			"-p/--proc cannot be used together with -b /proc. "
+			"PID virtualization replaces standard /proc bind mounting.");
+		return -1;
+	}
+
+	if (strcmp(trimmed, "/sys") == 0
+	    && get_extension(tracee, pid_virt_callback) != NULL) {
+		note(tracee, ERROR, USER,
+			"-p/--proc cannot be used together with -b /sys. "
+			"Sysfs virtualization replaces standard /sys bind mounting.");
+		return -1;
 	}
 
 	new_binding(tracee, host, guest, true);
@@ -331,10 +356,29 @@ static int handle_option_H(Tracee *tracee, const Cli *cli UNUSED, const char *va
         return 0;
 }
 
-static int handle_option_p(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
+static int handle_option_port_switch(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
 {
         (void) initialize_extension(tracee, port_switch_callback, NULL);
         return 0;
+}
+
+static int handle_option_proc(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
+{
+	int status;
+
+	if (pid_virt_binding_conflicts(tracee)) {
+		note(tracee, ERROR, USER,
+			"-p/--proc cannot be used together with -b /proc or -b /sys. "
+			"PID/sysfs virtualization replaces standard bind mounting for "
+			"those paths.");
+		return -1;
+	}
+
+	status = initialize_extension(tracee, pid_virt_callback, NULL);
+	if (status < 0)
+		note(tracee, WARNING, INTERNAL, "pid virtualization not initialized");
+
+	return 0;
 }
 
 /**

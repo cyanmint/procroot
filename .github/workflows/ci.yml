@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libtalloc-dev \
+            gcc-multilib \
+            libc6-dev-i386 \
+            pkg-config
+
+      - name: Build procroot (statically linked)
+        run: |
+          make -C src -j"$(nproc)" LDFLAGS="-static -ltalloc -Wl,-z,noexecstack"
+
+      - name: Build checker (statically linked)
+        run: |
+          make -C tests/checker static
+
+      - name: Verify binaries are statically linked
+        run: |
+          file src/procroot tests/checker/checker
+          ldd src/procroot 2>&1 | grep -q "not a dynamic executable"
+          ldd tests/checker/checker 2>&1 | grep -q "not a dynamic executable"
+
+      - name: Run PID/proc/sys virtualization checker under procroot -p
+        run: |
+          ./src/procroot -p ./tests/checker/checker
+
+  build-android-ndk:
+    # Cross-compiles procroot and the checker against the Android NDK
+    # (dynamically linked against Android's bionic libc, as normal for
+    # Android binaries) with libtalloc statically embedded into each
+    # program instead of relying on a shared libtalloc.so.
+    #
+    # libtalloc itself is not built from source here: the prebuilt
+    # libtalloc-static package from the Termux repository is fetched
+    # and used directly, since Termux already builds it for Android/bionic
+    # with an ABI compatible with NDK-built binaries.
+    #
+    # This job only verifies that the cross-compiled binaries link
+    # successfully; it cannot execute Android/bionic binaries on the
+    # (x86_64 Linux/glibc) GitHub-hosted runner.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Fetch prebuilt libtalloc-static from Termux
+        env:
+          TERMUX_ARCH: aarch64
+          TALLOC_VERSION: 2.4.3
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/android-libs/lib" "$GITHUB_WORKSPACE/android-libs/include" /tmp/termux-talloc
+          cd /tmp/termux-talloc
+
+          curl -fsSL -o libtalloc-static.deb \
+            "https://packages.termux.dev/apt/termux-main/pool/main/libt/libtalloc-static/libtalloc-static_${TALLOC_VERSION}_${TERMUX_ARCH}.deb"
+          curl -fsSL -o libtalloc.deb \
+            "https://packages.termux.dev/apt/termux-main/pool/main/libt/libtalloc/libtalloc_${TALLOC_VERSION}_${TERMUX_ARCH}.deb"
+
+          ar x libtalloc-static.deb
+          tar -xJf data.tar.xz
+          find . -name 'libtalloc.a' -exec cp {} "$GITHUB_WORKSPACE/android-libs/lib/" \;
+
+          rm -rf data.tar.xz data
+          ar x libtalloc.deb
+          tar -xJf data.tar.xz
+          find . -name 'talloc.h' -exec cp {} "$GITHUB_WORKSPACE/android-libs/include/" \;
+
+          test -f "$GITHUB_WORKSPACE/android-libs/lib/libtalloc.a"
+          test -f "$GITHUB_WORKSPACE/android-libs/include/talloc.h"
+
+      - name: Build procroot and checker for Android (dynamic, static libtalloc)
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          TARGET: aarch64-linux-android24
+        run: |
+          set -e
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          export CC="$TOOLCHAIN/bin/${TARGET}-clang"
+
+          # libtalloc is linked statically (its .a is given directly to
+          # the linker); everything else (libc, libdl, ...) stays the
+          # normal Android dynamic linking.
+          #
+          # CPPFLAGS and STRIP/OBJCOPY/OBJDUMP are set on the make
+          # command line here, which overrides (rather than appends to)
+          # src/GNUmakefile's own "+=" defaults, so the usual
+          # defines/include paths must be repeated explicitly, and the
+          # toolchain's llvm-* binutils must be used since the host's
+          # GNU binutils cannot handle the loader's Android/aarch64
+          # ELF output (strip/objdump misidentify or reject it).
+          make -C src -j"$(nproc)" \
+            CC="$CC" \
+            STRIP="$TOOLCHAIN/bin/llvm-strip" \
+            OBJCOPY="$TOOLCHAIN/bin/llvm-objcopy" \
+            OBJDUMP="$TOOLCHAIN/bin/llvm-objdump" \
+            CPPFLAGS="-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I. -I$GITHUB_WORKSPACE/android-libs/include" \
+            LDFLAGS="$GITHUB_WORKSPACE/android-libs/lib/libtalloc.a -Wl,-z,noexecstack"
+
+          make -C tests/checker \
+            CC="$CC"
+
+      - name: Verify Android binaries
+        run: |
+          file src/procroot tests/checker/checker
+          
+      - name: upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: src/procroot

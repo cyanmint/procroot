@@ -68,7 +68,8 @@ static int handle_option_sysvipc(Tracee *tracee, const Cli *cli, const char *val
 static int handle_option_kill_on_exit(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_L(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_H(Tracee *tracee, const Cli *cli, const char *value);
-static int handle_option_p(Tracee *tracee, const Cli *cli, const char *value);
+static int handle_option_port_switch(Tracee *tracee, const Cli *cli, const char *value);
+static int handle_option_proc(Tracee *tracee, const Cli *cli, const char *value);
 
 static int pre_initialize_bindings(Tracee *, const Cli *, size_t, char *const *, size_t);
 static int post_initialize_exe(Tracee *, const Cli *, size_t, char *const *, size_t);
@@ -274,11 +275,32 @@ Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
         },
         { .class = "Extension options",
           .arguments = {
-                { .name = "-p", .separator = '\0', .value = NULL },
+                { .name = "-P", .separator = '\0', .value = NULL },
+                { .name = "--port-switch", .separator = '\0', .value = NULL },
                 { .name = NULL, .separator = '\0', .value = NULL } },
-          .handler = handle_option_p,
+          .handler = handle_option_port_switch,
           .description = "Modify bindings to protected ports to use a higher port number.",
           .detail = "",
+        },
+        { .class = "Extension options",
+          .arguments = {
+                { .name = "-p", .separator = '\0', .value = NULL },
+                { .name = "--proc", .separator = '\0', .value = NULL },
+                { .name = NULL, .separator = '\0', .value = NULL } },
+          .handler = handle_option_proc,
+          .description = "Enable user-space PID namespace virtualization.",
+          .detail = "\tThe guest process tree is renumbered so that the initial guest\n\
+\tprocess appears as PID 1, mimicking a real PID namespace.  All\n\
+\tPID-related syscalls (getpid, getppid, gettid, getpgid, getsid,\n\
+\tkill, tgkill, tkill, ptrace, sched_{set,get}affinity, ...) are\n\
+\ttranslated between host and guest PIDs.  /proc is dynamically\n\
+\tvirtualized instead of being bound from the host: numeric PID\n\
+\tentries are renumbered/filtered, and /proc/self always points to\n\
+\tthe calling guest process.  /sys, and any non-PID part of /proc\n\
+\t(e.g. /proc/cpuinfo), are mirrored straight from the host; any\n\
+\toperation on them that fails on the host is silently turned into\n\
+\ta no-op success on the guest side.  This option is mutually\n\
+\texclusive with binding the host /proc or /sys (-b /proc, -b /sys).",
         },
         { .class = "Extension options",
           .arguments = {
