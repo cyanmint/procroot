@@ -1,9 +1,13 @@
-/* Userspace Binder UAPI compatibility layer.
+/*
+ * Userspace Binder UAPI compatibility layer.
  *
- * The extension owns the Binder process state in the tracer and handles the
- * non-blocking Binder control ABI without requiring a Binder kernel module.
- * Transaction routing is deliberately isolated behind binder_process_write_read;
- * this keeps the UAPI parser independent from the future broker transport.
+ * The protocol definitions and object translation rules are implemented from
+ * the upstream Linux Binder UAPI reference copied in upstream/binder_uapi.h.
+ * The copied reference retains its upstream copyright and SPDX notices; this
+ * procroot broker is an independent userspace implementation and does not
+ * compile the GPL kernel driver.
+ *
+ * Copyright (C) 2026 procroot contributors for this implementation.
  */
 #include <errno.h>
 #include <stdbool.h>
@@ -78,11 +82,17 @@ struct binder_write_read {
 #define MAX_BINDER_TRANSACTIONS 32
 #define MAX_BINDER_PAYLOAD 65536
 #define MAX_BINDER_OFFSETS (MAX_BINDER_PAYLOAD / sizeof(uint64_t))
-#define BINDER_TYPE_BINDER 0x85
-#define BINDER_TYPE_WEAK_BINDER 0x80
-#define BINDER_TYPE_HANDLE 0x86
-#define BINDER_TYPE_WEAK_HANDLE 0x81
-#define BINDER_TYPE_FD 0x87
+#define B_PACK_CHARS(c1, c2, c3, c4) \
+	((((uint32_t)(c1)) << 24) | (((uint32_t)(c2)) << 16) | \
+	 (((uint32_t)(c3)) << 8) | (uint32_t)(c4))
+#define B_TYPE_LARGE 0x85
+#define BINDER_TYPE_BINDER B_PACK_CHARS('s', 'b', '*', B_TYPE_LARGE)
+#define BINDER_TYPE_WEAK_BINDER B_PACK_CHARS('w', 'b', '*', B_TYPE_LARGE)
+#define BINDER_TYPE_HANDLE B_PACK_CHARS('s', 'h', '*', B_TYPE_LARGE)
+#define BINDER_TYPE_WEAK_HANDLE B_PACK_CHARS('w', 'h', '*', B_TYPE_LARGE)
+#define BINDER_TYPE_FD B_PACK_CHARS('f', 'd', '*', B_TYPE_LARGE)
+#define BINDER_TYPE_FDA B_PACK_CHARS('f', 'd', 'a', B_TYPE_LARGE)
+#define BINDER_TYPE_PTR B_PACK_CHARS('p', 't', '*', B_TYPE_LARGE)
 
 enum BinderDomain {
 	BINDER_DOMAIN_BINDER = 0,
