@@ -84,6 +84,7 @@ OBJECTS += \
 	extension/mountinfo/mountinfo.o \
 	extension/port_switch/port_switch.o \
 	extension/pid_virt/pid_virt.o \
+	extension/binder/binder.o \
 	extension/sysvipc/sysvipc.o \
 	extension/sysvipc/sysvipc_msg.o \
 	extension/sysvipc/sysvipc_sem.o \
@@ -92,7 +93,7 @@ OBJECTS += \
 	extension/fix_symlink_size/fix_symlink_size.o
 
 define define_from_arch.h
-$2$1 := $(shell $(CC) $1 -E -dM -DNO_LIBC_HEADER $(SRC)/arch.h | grep -w $2 | cut -f 3 -d ' ')
+$2$1 := $(shell $(CC) $(CPPFLAGS) $1 -E -dM -DNO_LIBC_HEADER $(SRC)/arch.h | grep -w $2 | cut -f 3 -d ' ')
 endef
 
 $(eval $(call define_from_arch.h,,HAS_LOADER_32BIT))

@@ -28,7 +28,8 @@
 #include "cli/cli.h"
 #include "cli/note.h"
 #include "extension/extension.h"
-#include "extension/sysvipc/sysvipc.h"
+#include <extension/sysvipc/sysvipc.h>
+extern int binder_callback(Extension *, ExtensionEvent, intptr_t, intptr_t);
 #include "path/binding.h"
 #include "attribute.h"
 
@@ -360,6 +361,14 @@ static int handle_option_port_switch(Tracee *tracee, const Cli *cli UNUSED, cons
 {
         (void) initialize_extension(tracee, port_switch_callback, NULL);
         return 0;
+}
+
+static int handle_option_binder(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
+{
+	int status = initialize_extension(tracee, binder_callback, NULL);
+	if (status < 0)
+		note(tracee, WARNING, INTERNAL, "binder not initialized");
+	return status;
 }
 
 static int handle_option_proc(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)

@@ -140,7 +140,9 @@ typedef unsigned char byte_t;
     #define INTERP_PIC_ADDRESS 0x3f00000000
     #define HAS_POKEDATA_WORKAROUND true
 
+    #ifndef PROCROOT_NO_LOADER_32BIT
     #define HAS_LOADER_32BIT true
+    #endif
     #define EXEC_PIC_ADDRESS_32   0x0f000000
     #define INTERP_PIC_ADDRESS_32 0x1f000000
 

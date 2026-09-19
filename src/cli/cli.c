@@ -352,10 +352,8 @@ static int parse_config(Tracee *tracee, size_t argc, char *const argv[])
 
 				/* Avoid ambiguities.  */
 				if (strlen(arg) > length
-				    && arg[length] != argument->separator) {
-					print_error_separator(tracee, argument);
-					return -1;
-				}
+				    && arg[length] != argument->separator)
+					continue;
 
 				/* No option value.  */
 				if (!argument->value) {
