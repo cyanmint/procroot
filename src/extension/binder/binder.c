@@ -82,6 +82,7 @@ struct binder_write_read {
 #define MAX_BINDER_TRANSACTIONS 32
 #define MAX_BINDER_PAYLOAD 65536
 #define MAX_BINDER_OFFSETS (MAX_BINDER_PAYLOAD / sizeof(uint64_t))
+#define MAX_BINDER_BUFFERS 64
 #define B_PACK_CHARS(c1, c2, c3, c4) \
 	((((uint32_t)(c1)) << 24) | (((uint32_t)(c2)) << 16) | \
 	 (((uint32_t)(c3)) << 8) | (uint32_t)(c4))
@@ -113,6 +114,11 @@ typedef struct {
 	size_t read_count;
 } BinderFd;
 typedef struct {
+	word_t address;
+	size_t size;
+	bool active;
+} BinderBuffer;
+typedef struct {
 	uint32_t command;
 	struct binder_transaction_data transaction;
 	size_t payload_size;
@@ -126,6 +132,7 @@ struct BinderEndpoint {
 	bool context_manager;
 	BinderTransaction queue[MAX_BINDER_TRANSACTIONS];
 	size_t queue_count;
+	BinderBuffer buffers[MAX_BINDER_BUFFERS];
 	BinderEndpoint *last_sender;
 	BinderEndpoint *handles[256];
 };
@@ -290,6 +297,30 @@ static int enqueue_transaction(BinderEndpoint *target,
 	return 0;
 }
 
+static int register_buffer(BinderEndpoint *endpoint, word_t address, size_t size)
+{
+	size_t i;
+	for (i = 0; i < MAX_BINDER_BUFFERS; i++)
+		if (!endpoint->buffers[i].active) {
+			endpoint->buffers[i].active = true;
+			endpoint->buffers[i].address = address;
+			endpoint->buffers[i].size = size;
+			return 0;
+		}
+	return -ENOSPC;
+}
+static int free_buffer(BinderEndpoint *endpoint, word_t address)
+{
+	size_t i;
+	for (i = 0; i < MAX_BINDER_BUFFERS; i++)
+		if (endpoint->buffers[i].active &&
+		    endpoint->buffers[i].address == address) {
+			memset(&endpoint->buffers[i], 0, sizeof(endpoint->buffers[i]));
+			return 0;
+		}
+	return -EINVAL;
+}
+
 static void dequeue_transaction(BinderEndpoint *endpoint)
 {
 	if (endpoint->queue_count > 1)
@@ -309,8 +340,9 @@ static int queue_word(BinderFd *f, uint32_t word)
 	if (f->read_count >= MAX_BINDER_REPLY_WORDS) return -ENOSPC;
 	f->read_words[f->read_count++] = word; return 0;
 }
-static int deliver_transaction(Tracee *target_tracee, BinderTransaction *item,
-		word_t read_buffer, size_t read_size, size_t *used)
+static int deliver_transaction(Tracee *target_tracee, BinderEndpoint *target,
+		BinderTransaction *item, word_t read_buffer, size_t read_size,
+		size_t *used)
 {
 	struct binder_transaction_data transaction = item->transaction;
 	word_t data_address = 0;
@@ -337,6 +369,9 @@ static int deliver_transaction(Tracee *target_tracee, BinderTransaction *item,
 	    (item->offsets_size != 0 && write_data(target_tracee, offsets_address,
 			item->offsets, item->offsets_size) < 0))
 		return -EFAULT;
+	if (data_address != 0 &&
+	    register_buffer(target, data_address, item->payload_size) < 0)
+		return -ENOSPC;
 	*used = total;
 	return 0;
 }
@@ -401,12 +436,17 @@ static int binder_process_write_read(Tracee *t, BinderFd *f, word_t arg)
 			if (queue_word(f, BR_TRANSACTION_COMPLETE) < 0)
 				return -ENOSPC;
 			break;
-		case BC_FREE_BUFFER:
-			if (bwr.write_consumed + sizeof(binder_uintptr_t) > bwr.write_size)
+		case BC_FREE_BUFFER: {
+			binder_uintptr_t buffer;
+			if (bwr.write_consumed + sizeof(buffer) > bwr.write_size ||
+			    read_data(t, &buffer, pos, sizeof(buffer)) < 0)
 				return -EINVAL;
-			pos += sizeof(binder_uintptr_t);
-			bwr.write_consumed += sizeof(binder_uintptr_t);
+			pos += sizeof(buffer);
+			bwr.write_consumed += sizeof(buffer);
+			if (free_buffer(self, buffer) < 0)
+				return -EINVAL;
 			break;
+		}
 		case BC_ENTER_LOOPER:
 		case BC_REGISTER_LOOPER:
 		case BC_EXIT_LOOPER:
@@ -417,7 +457,7 @@ static int binder_process_write_read(Tracee *t, BinderFd *f, word_t arg)
 	}
 	if (self->queue_count != 0 && bwr.read_buffer != 0) {
 		size_t used = 0;
-		int status = deliver_transaction(t, &self->queue[0],
+		int status = deliver_transaction(t, self, &self->queue[0],
 			bwr.read_buffer, bwr.read_size, &used);
 		if (status == 0) {
 			bwr.read_consumed = used;
