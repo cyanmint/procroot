@@ -30,6 +30,7 @@
 #include "extension/extension.h"
 #include <extension/sysvipc/sysvipc.h>
 extern int binder_callback(Extension *, ExtensionEvent, intptr_t, intptr_t);
+extern int pid_virt_callback(Extension *, ExtensionEvent, intptr_t, intptr_t);
 #include "path/binding.h"
 #include "attribute.h"
 
@@ -365,9 +366,22 @@ static int handle_option_port_switch(Tracee *tracee, const Cli *cli UNUSED, cons
 
 static int handle_option_binder(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
 {
-	int status = initialize_extension(tracee, binder_callback, NULL);
+	int status;
+
+	/* -B is the redroid environment: Android init needs a virtual PID
+	 * namespace, userspace Binder, and writable runtime paths. */
+	status = initialize_extension(tracee, pid_virt_callback, NULL);
+	if (status < 0)
+		note(tracee, WARNING, INTERNAL, "pid virtualization not initialized");
+
+	status = initialize_extension(tracee, binder_callback, NULL);
 	if (status < 0)
 		note(tracee, WARNING, INTERNAL, "binder not initialized");
+
+	/* Do not bind host /dev or /tmp here.  Android's ueventd and init must
+	 * see the rootfs-owned paths; exposing the host /dev causes ueventd to
+	 * consume the host device state and can create an unbounded error loop.
+	 * Callers may add narrowly-scoped bindings explicitly when required. */
 	return status;
 }
 
