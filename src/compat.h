@@ -261,8 +261,11 @@
 #    ifndef NT_ARM_SYSTEM_CALL
 #        define NT_ARM_SYSTEM_CALL		0x404
 #    endif
-#    ifndef SYS_SECCOMP
-#        define SYS_SECCOMP 1
+/* Linux UAPI headers expose SYS_SECCOMP as an enum constant on some
+ * platforms.  Keep our fallback private so it cannot collide with that
+ * identifier after the headers are included. */
+#    ifndef PROOT_SYS_SECCOMP
+#        define PROOT_SYS_SECCOMP 1
 #    endif
 
 /* openat2(2) "how" argument.  Mirrors struct open_how from

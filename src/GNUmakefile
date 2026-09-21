@@ -173,8 +173,11 @@ build.h: $(CHECK_RESULTS)
 
 BUILD_ID_NONE := $(shell printf 'int main(void){return 0;}\n' | $(LD) -xc - -Wl,--build-id=none -o /dev/null >/dev/null 2>&1 && echo ',--build-id=none')
 
-# Android NDK r29+ compatibility
-ROSEGMENT := $(shell printf 'int main(void){return 0;}\n' | $(LD) -xc - -Wl,--rosegment -o /dev/null >/dev/null 2>&1 && echo ',--rosegment')
+# --rosegment is required by newer LLVM lld/Android NDK linkers, but
+# GNU ld 2.47 accepts it with different semantics that place the loader's
+# read-only section outside the x86_64 PC-relative range.  Only enable it
+# when the selected linker identifies itself as lld.
+ROSEGMENT := $(shell $(LD) -Wl,--version 2>&1 | grep -q 'LLD' && printf ',--rosegment')
 
 ######################################################################
 # Build rules
