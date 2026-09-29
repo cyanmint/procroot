@@ -738,12 +738,16 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 
 		case SIGTRAP | PTRACE_EVENT_VFORK << 8:
 			signal = 0;
+			tracee->restart_how = PTRACE_SYSCALL;
+			tracee->sysexit_pending = true;
 			(void) new_child(tracee, CLONE_VFORK);
 			break;
 
 		case SIGTRAP | PTRACE_EVENT_FORK  << 8:
 		case SIGTRAP | PTRACE_EVENT_CLONE << 8:
 			signal = 0;
+			tracee->restart_how = PTRACE_SYSCALL;
+			tracee->sysexit_pending = true;
 			(void) new_child(tracee, 0);
 			break;
 

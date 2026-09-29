@@ -56,6 +56,7 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_tgkill,		0 },
 	{ PR_tkill,		0 },
 	{ PR_ptrace,		0 },
+	{ PR_setpgid,		0 },
 	{ PR_sched_setaffinity,	0 },
 	{ PR_sched_getaffinity,	0 },
 	{ PR_getdents64,	FILTER_SYSEXIT },
@@ -65,10 +66,10 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_openat,		FILTER_SYSEXIT },
 	{ PR_open,		FILTER_SYSEXIT },
 	{ PR_close,		0 },
-	{ PR_clone,		0 },
-	{ PR_clone3,		0 },
-	{ PR_fork,		0 },
-	{ PR_vfork,		0 },
+	{ PR_clone,		FILTER_SYSEXIT },
+	{ PR_clone3,		FILTER_SYSEXIT },
+	{ PR_fork,		FILTER_SYSEXIT },
+	{ PR_vfork,		FILTER_SYSEXIT },
 	/* /sys write-failure spoofing: report success without doing
 	 * anything when these fail while targeting "/sys".  */
 	{ PR_write,		FILTER_SYSEXIT },
@@ -425,6 +426,16 @@ static int handle_sysenter(Tracee *tracee)
 		break;
 
 	case PR_ptrace:
+		translate_vpid_arg(tracee, SYSARG_2);
+		break;
+
+	case PR_getpgid:
+	case PR_getsid:
+		translate_vpid_arg(tracee, SYSARG_1);
+		break;
+
+	case PR_setpgid:
+		translate_vpid_arg(tracee, SYSARG_1);
 		translate_vpid_arg(tracee, SYSARG_2);
 		break;
 
