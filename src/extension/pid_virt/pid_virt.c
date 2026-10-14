@@ -1011,6 +1011,10 @@ static void handle_sysexit(Tracee *tracee, Config *config)
 		handle_clone_exit(tracee, sysnum);
 		break;
 
+	case PR_waitid:
+		handle_waitid_exit(tracee);
+		break;
+
 	case PR_getdents64:
 		handle_getdents64_exit(tracee, config);
 		break;
