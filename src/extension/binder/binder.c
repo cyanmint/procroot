@@ -119,6 +119,7 @@ typedef struct {
 	int fd;
 	bool active;
 	enum BinderDomain domain;
+	bool uevent_socket;
 	bool context_manager;
 	uint32_t max_threads;
 	uint32_t read_words[MAX_BINDER_REPLY_WORDS];
@@ -150,6 +151,7 @@ struct BinderEndpoint {
 typedef struct {
 	bool last_binder_path;
 	enum BinderDomain last_domain;
+	bool uevent_socket_pending;
 	bool ioctl_pending;
 	int pending_fd;
 	unsigned long pending_request;
@@ -169,7 +171,8 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_x32_ioctl, FILTER_SYSEXIT },
 	{ PR_mmap, FILTER_SYSEXIT }, { PR_mmap2, FILTER_SYSEXIT },
 	{ PR_mknod, FILTER_SYSEXIT }, { PR_mknodat, FILTER_SYSEXIT },
-	{ PR_close, 0 }, FILTERED_SYSNUM_END,
+	{ PR_socket, FILTER_SYSEXIT }, { PR_bind, 0 }, { PR_close, 0 },
+	FILTERED_SYSNUM_END,
 };
 static enum BinderDomain binder_domain(const char *p)
 {
@@ -202,6 +205,33 @@ static void remember_fd(BinderConfig *c, int fd, enum BinderDomain domain)
 	for (i = 0; i < MAX_BINDER_FDS; i++) if (!c->fds[i].active) {
 		c->fds[i].active = true; c->fds[i].fd = fd; c->fds[i].domain = domain; return;
 	}
+}
+static void remember_uevent_socket(BinderConfig *c, int fd)
+{
+	int i;
+	BinderFd *f;
+
+	if (fd < 0)
+		return;
+	f = find_fd(c, fd);
+	if (f != NULL) {
+		f->uevent_socket = true;
+		return;
+	}
+	for (i = 0; i < MAX_BINDER_FDS; i++) {
+		if (!c->fds[i].active) {
+			c->fds[i].active = true;
+			c->fds[i].fd = fd;
+			c->fds[i].domain = BINDER_DOMAIN_NONE;
+			c->fds[i].uevent_socket = true;
+			return;
+		}
+	}
+}
+static bool is_uevent_socket(BinderConfig *c, int fd)
+{
+	BinderFd *f = find_fd(c, fd);
+	return f != NULL && f->uevent_socket;
 }
 static BinderEndpoint *endpoint_for(Tracee *tracee)
 {
@@ -547,7 +577,23 @@ int binder_callback(Extension *e, ExtensionEvent event, intptr_t data1, intptr_t
 		if (s == PR_socket &&
 		    peek_reg(t, CURRENT, SYSARG_1) == AF_NETLINK &&
 		    peek_reg(t, CURRENT, SYSARG_3) == NETLINK_KOBJECT_UEVENT)
-			return -EAFNOSUPPORT;
+			c->uevent_socket_pending = true;
+		if (s == PR_bind &&
+		    is_uevent_socket(c, (int)peek_reg(t, CURRENT, SYSARG_1))) {
+			word_t address_ptr = peek_reg(t, CURRENT, SYSARG_2);
+			word_t address_size = peek_reg(t, CURRENT, SYSARG_3);
+			struct sockaddr_nl address;
+
+			if (address_ptr != 0 && address_size >= sizeof(address) &&
+			    read_data(t, &address, address_ptr, sizeof(address)) == 0 &&
+			    address.nl_family == AF_NETLINK && address.nl_groups != 0) {
+				/* Never subscribe a guest ueventd to host-global
+				 * kernel broadcasts.  Bind it without multicast groups. */
+				address.nl_groups = 0;
+				if (write_data(t, address_ptr, &address, sizeof(address)) < 0)
+					return -EFAULT;
+			}
+		}
 		if (s == PR_mmap || s == PR_mmap2) {
 			int fd = (int)peek_reg(t, CURRENT, SYSARG_5);
 			BinderFd *f = find_fd(c, fd);
@@ -591,6 +637,12 @@ int binder_callback(Extension *e, ExtensionEvent event, intptr_t data1, intptr_t
 		return 0;
 	case SYSCALL_EXIT_END:
 		c = talloc_get_type_abort(e->config, BinderConfig); s = get_sysnum(t, ORIGINAL);
+		if (s == PR_socket && c->uevent_socket_pending) {
+			long fd = (long)peek_reg(t, CURRENT, SYSARG_RESULT);
+			if (fd >= 0)
+				remember_uevent_socket(c, (int)fd);
+			c->uevent_socket_pending = false;
+		}
 		if ((s == PR_ioctl || s == PR_x32_ioctl) && !c->ioctl_pending) {
 			int fd = (int) peek_reg(t, CURRENT, SYSARG_1);
 			unsigned long req = peek_reg(t, CURRENT, SYSARG_2);
