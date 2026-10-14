@@ -19,11 +19,20 @@ int main(void)
 
 	siginfo_t info = { 0 };
 	errno = 0;
-	int rc = waitid(P_ALL, 0, &info, WEXITED);
-	int saved_errno = errno;
+	int rc = waitid(P_ALL, 0, &info, WEXITED | WNOWAIT);
+	int waitid_errno = errno;
 	printf("self=%ld child=%ld waitid_rc=%d errno=%d si_pid=%ld\n",
-	       (long)self, (long)child, rc, saved_errno, (long)info.si_pid);
+	       (long)self, (long)child, rc, waitid_errno, (long)info.si_pid);
 	if (rc != 0 || self != 1 || child != 2 || info.si_pid != child)
+		return 1;
+
+	int status = 0;
+	errno = 0;
+	pid_t waited = waitpid(info.si_pid, &status, 0);
+	int waitpid_errno = errno;
+	printf("waitpid_rc=%ld errno=%d status=%d\n",
+	       (long)waited, waitpid_errno, status);
+	if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		return 1;
 	return 0;
 }

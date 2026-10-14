@@ -72,6 +72,8 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_clone3,		FILTER_SYSEXIT },
 	{ PR_fork,		FILTER_SYSEXIT },
 	{ PR_vfork,		FILTER_SYSEXIT },
+	{ PR_wait4,		FILTER_SYSEXIT },
+	{ PR_waitpid,		FILTER_SYSEXIT },
 	{ PR_waitid,		FILTER_SYSEXIT },
 	/* /sys write-failure spoofing: report success without doing
 	 * anything when these fail while targeting "/sys".  */
@@ -426,7 +428,31 @@ static void translate_vpid_arg(Tracee *tracee, Reg reg)
 	poke_reg(tracee, reg, (word_t) target->pid);
 }
 
-static int handle_sysenter(Tracee *tracee)
+static void translate_wait_vpid_arg(Tracee *tracee, Config *config, Reg reg)
+{
+	word_t value = peek_reg(tracee, CURRENT, reg);
+	Tracee *target;
+	size_t i;
+
+	if ((int64_t) value <= 0)
+		return;
+
+	target = get_tracee_by_vpid((uint64_t) value);
+	if (target != NULL) {
+		poke_reg(tracee, reg, (word_t) target->pid);
+		return;
+	}
+
+	for (i = 0; i < child_pid_mapping_count; i++) {
+		if (child_pid_mappings[i].vpid == (uint64_t) value
+		    && child_pid_mappings[i].parent_tgid_vpid == config->tgid_vpid) {
+			poke_reg(tracee, reg, (word_t) child_pid_mappings[i].host_pid);
+			return;
+		}
+	}
+}
+
+static int handle_sysenter(Tracee *tracee, Config *config)
 {
 	Sysnum sysnum = get_sysnum(tracee, ORIGINAL);
 
@@ -457,12 +483,14 @@ static int handle_sysenter(Tracee *tracee)
 
 	case PR_wait4:
 	case PR_waitpid:
-		translate_vpid_arg(tracee, SYSARG_1);
+		translate_wait_vpid_arg(tracee, config, SYSARG_1);
 		break;
 
 	case PR_waitid: {
 		word_t idtype = peek_reg(tracee, CURRENT, SYSARG_1);
-		if (idtype == P_PID || idtype == P_PGID)
+		if (idtype == P_PID)
+			translate_wait_vpid_arg(tracee, config, SYSARG_2);
+		else if (idtype == P_PGID)
 			translate_vpid_arg(tracee, SYSARG_2);
 		break;
 	}
@@ -1074,6 +1102,29 @@ static void handle_waitid_exit(Tracee *tracee, Config *config)
 		forget_child_pid(config->tgid_vpid, host_pid);
 }
 
+static void handle_wait_exit(Tracee *tracee, Config *config)
+{
+	int64_t result = (int64_t) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	word_t status_addr;
+	int child_status;
+	pid_t host_pid;
+
+	if (result <= 0)
+		return;
+
+	host_pid = (pid_t) result;
+	poke_reg(tracee, SYSARG_RESULT,
+		 (word_t) child_host_pid_to_vpid(config->tgid_vpid, host_pid));
+
+	status_addr = peek_reg(tracee, ORIGINAL, SYSARG_2);
+	if (status_addr == 0 || read_data(tracee, &child_status, status_addr,
+					  sizeof(child_status)) < 0)
+		return;
+
+	if (WIFEXITED(child_status) || WIFSIGNALED(child_status))
+		forget_child_pid(config->tgid_vpid, host_pid);
+}
+
 static void handle_sysexit(Tracee *tracee, Config *config)
 {
 	Sysnum sysnum = get_sysnum(tracee, ORIGINAL);
@@ -1109,6 +1160,11 @@ static void handle_sysexit(Tracee *tracee, Config *config)
 
 	case PR_waitid:
 		handle_waitid_exit(tracee, config);
+		break;
+
+	case PR_wait4:
+	case PR_waitpid:
+		handle_wait_exit(tracee, config);
 		break;
 
 	case PR_getdents64:
@@ -1263,7 +1319,7 @@ int pid_virt_callback(Extension *extension, ExtensionEvent event,
 		if (sysnum == PR_close)
 			handle_close_enter(tracee, config);
 
-		return handle_sysenter(tracee);
+		return handle_sysenter(tracee, config);
 	}
 
 	case SYSCALL_ENTER_END: {
