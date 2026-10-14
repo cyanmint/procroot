@@ -378,6 +378,13 @@ static int handle_option_binder(Tracee *tracee, const Cli *cli UNUSED, const cha
 	if (status < 0)
 		note(tracee, WARNING, INTERNAL, "binder not initialized");
 
+	/* Android's property service requires /dev/__properties__ to be a
+	 * tmpfs-backed area.  Bind only the host's empty tmpfs (/dev/shm), not
+	 * the host device tree; this lets init create its property files while
+	 * keeping ueventd isolated from host devices. */
+	if (new_binding(tracee, "/dev/shm", "/dev/__properties__", false) == NULL)
+		note(tracee, WARNING, INTERNAL, "redroid property area binding not initialized");
+
 	/* Do not bind host /dev or /tmp here.  Android's ueventd and init must
 	 * see the rootfs-owned paths; exposing the host /dev causes ueventd to
 	 * consume the host device state and can create an unbounded error loop.

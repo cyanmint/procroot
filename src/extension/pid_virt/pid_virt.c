@@ -29,6 +29,8 @@
 #include <inttypes.h>    /* PRIu64, */
 #include <fcntl.h>       /* O_*, AT_FDCWD, */
 #include <linux/sched.h> /* CLONE_*, */
+#include <signal.h>      /* siginfo_t, */
+#include <sys/wait.h>    /* P_PID, P_PGID, */
 
 #include "extension/extension.h"
 #include "extension/pid_virt/pid_virt.h"
@@ -70,6 +72,7 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_clone3,		FILTER_SYSEXIT },
 	{ PR_fork,		FILTER_SYSEXIT },
 	{ PR_vfork,		FILTER_SYSEXIT },
+	{ PR_waitid,		FILTER_SYSEXIT },
 	/* /sys write-failure spoofing: report success without doing
 	 * anything when these fail while targeting "/sys".  */
 	{ PR_write,		FILTER_SYSEXIT },
@@ -438,6 +441,18 @@ static int handle_sysenter(Tracee *tracee)
 		translate_vpid_arg(tracee, SYSARG_1);
 		translate_vpid_arg(tracee, SYSARG_2);
 		break;
+
+	case PR_wait4:
+	case PR_waitpid:
+		translate_vpid_arg(tracee, SYSARG_1);
+		break;
+
+	case PR_waitid: {
+		word_t idtype = peek_reg(tracee, CURRENT, SYSARG_1);
+		if (idtype == P_PID || idtype == P_PGID)
+			translate_vpid_arg(tracee, SYSARG_2);
+		break;
+	}
 
 	case PR_sched_setaffinity:
 	case PR_sched_getaffinity:
@@ -937,6 +952,30 @@ static void handle_clone_exit(Tracee *tracee, Sysnum sysnum)
 		if ((flags & CLONE_CHILD_SETTID) != 0)
 			write_back_tid(tracee, child_tidptr, child->vpid);
 	}
+}
+
+static void handle_waitid_exit(Tracee *tracee)
+{
+	word_t info_addr;
+	siginfo_t info;
+	int64_t result = (int64_t) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+
+	if (result != 0)
+		return;
+
+	info_addr = peek_reg(tracee, ORIGINAL, SYSARG_3);
+	if (info_addr == 0 || read_data(tracee, &info, info_addr, sizeof(info)) < 0)
+		return;
+
+	if (info.si_pid <= 0)
+		return; /* WNOHANG, or no child status was returned.  */
+
+	if (peek_reg(tracee, ORIGINAL, SYSARG_1) == P_PID)
+		info.si_pid = (pid_t) peek_reg(tracee, ORIGINAL, SYSARG_2);
+	else
+		info.si_pid = (pid_t) host_pid_to_vpid(info.si_pid);
+
+	(void) write_data(tracee, info_addr, &info, sizeof(info));
 }
 
 static void handle_sysexit(Tracee *tracee, Config *config)

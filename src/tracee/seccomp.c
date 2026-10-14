@@ -312,6 +312,7 @@ static int handle_seccomp_event_common(Tracee *tracee)
 		char path[PATH_MAX];
 		char original[PATH_MAX];
 		char devshm_path[PATH_MAX];
+		char properties_path[PATH_MAX];
 		struct statfs64 my_statfs64;
 		struct compat_statfs my_statfs;
 		size = read_string(tracee, original, peek_reg(tracee, CURRENT, SYSARG_1), PATH_MAX);
@@ -331,13 +332,18 @@ static int handle_seccomp_event_common(Tracee *tracee)
 			break;
 		}
 
-		/* Fake /dev/shm being tmpfs, see statfs handler in syscall/exit.c */
-		if (translate_path(tracee, devshm_path, AT_FDCWD, "/dev/shm", true) >= 0) {
-			Comparison comparison = compare_paths(devshm_path, path);
-			if (comparison == PATHS_ARE_EQUAL || comparison == PATH1_IS_PREFIX) {
-				my_statfs64.f_type = 0x01021994;
-			}
-		}
+		/* Android's property area requires tmpfs semantics.  PRoot's
+		 * rootfs is an ordinary host directory, so mirror the existing
+		 * /dev/shm compatibility and report tmpfs for both paths. */
+		if (translate_path(tracee, devshm_path, AT_FDCWD, "/dev/shm", true) >= 0 &&
+		    (compare_paths(devshm_path, path) == PATHS_ARE_EQUAL ||
+		     compare_paths(devshm_path, path) == PATH1_IS_PREFIX))
+			my_statfs64.f_type = 0x01021994;
+		if (translate_path(tracee, properties_path, AT_FDCWD,
+		                   "/dev/__properties__", true) >= 0 &&
+		    (compare_paths(properties_path, path) == PATHS_ARE_EQUAL ||
+		     compare_paths(properties_path, path) == PATH1_IS_PREFIX))
+			my_statfs64.f_type = 0x01021994;
 
 		if ((my_statfs64.f_blocks | my_statfs64.f_bfree | my_statfs64.f_bavail |
      		     my_statfs64.f_bsize | my_statfs64.f_frsize | my_statfs64.f_files | 

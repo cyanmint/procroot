@@ -683,8 +683,9 @@ void translate_syscall_exit(Tracee *tracee)
 
 	case PR_statfs:
 	case PR_statfs64: {
-		/* Possibly fake that /dev/shm is living on tmpfs */
+		/* Possibly fake Android's tmpfs-backed compatibility paths. */
 		char devshm_path[PATH_MAX];
+		char properties_path[PATH_MAX];
 		char statfs_path[PATH_MAX];
 
 		/* Only perform changes to result of successful syscall
@@ -721,8 +722,19 @@ void translate_syscall_exit(Tracee *tracee)
 				VERBOSE(tracee, 5, "Updating statfs() result failed");
 			}
 		}
+		else if (translate_path(tracee, properties_path, AT_FDCWD,
+		                        "/dev/__properties__", true) >= 0) {
+			comparison = compare_paths(properties_path, statfs_path);
+			if (comparison == PATHS_ARE_EQUAL || comparison == PATH1_IS_PREFIX) {
+				VERBOSE(tracee, 5, "Updating statfs() result to fake tmpfs /dev/__properties__");
+				word_t stat_addr = peek_reg(tracee, ORIGINAL,
+				                            syscall_number == PR_statfs64 ? SYSARG_3 : SYSARG_2);
+				if (write_data(tracee, stat_addr, "\x94\x19\x02\x01", 4) < 0)
+					VERBOSE(tracee, 5, "Updating property statfs() result failed");
+			}
+		}
 		else {
-			VERBOSE(tracee, 5, "statfs() not for /dev/shm, not changing result");
+			VERBOSE(tracee, 5, "statfs() not for compatibility paths, not changing result");
 		}
 
 		goto end;

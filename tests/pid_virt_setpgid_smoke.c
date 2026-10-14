@@ -35,21 +35,23 @@ int main(void)
     close(p[0]);
 
     errno = 0;
-    int rc = setpgid(child, child);
-    int saved_errno = errno;
+    int group_rc = setpgid(child, child);
+    int group_errno = errno;
     pid_t pgid = getpgid(child);
-    printf("self=%ld child_return=%ld child_getpid=%ld setpgid_rc=%d errno=%d pgid=%ld\n",
+    kill(child, SIGTERM);
+
+    siginfo_t info = {};
+    errno = 0;
+    int wait_rc = waitid(P_PID, (id_t) child, &info, WEXITED);
+    int wait_errno = errno;
+    printf("self=%ld child_return=%ld child_getpid=%ld setpgid_rc=%d errno=%d pgid=%ld waitid_rc=%d errno=%d si_pid=%ld\n",
            (long) self, (long) child, (long) child_visible,
-           rc, saved_errno, (long) pgid);
+           group_rc, group_errno, (long) pgid, wait_rc, wait_errno,
+           (long) info.si_pid);
     fflush(stdout);
 
     if (got != sizeof(child_visible) || self != 1 || child != child_visible ||
-        rc != 0 || pgid != child) {
-        kill(child, SIGKILL);
-        waitpid(child, NULL, 0);
+        group_rc != 0 || pgid != child || wait_rc != 0 || info.si_pid != child)
         return 1;
-    }
-    kill(child, SIGTERM);
-    waitpid(child, NULL, 0);
     return 0;
 }

@@ -14,6 +14,9 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <sys/reboot.h>
 #include <sys/mman.h>
 #include <talloc.h>
 
@@ -75,6 +78,14 @@ struct binder_write_read {
 #define BINDER_SET_CONTEXT_MGR_EXT _IOW(BINDER_IOCTL_TYPE, 13, struct binder_context_mgr_ext)
 #define BINDER_THREAD_EXIT _IOW(BINDER_IOCTL_TYPE, 8, uint32_t)
 #define BINDER_WRITE_READ _IOWR(BINDER_IOCTL_TYPE, 1, struct binder_write_read)
+struct procroot_binderfs_device {
+	char name[256];
+	uint32_t major;
+	uint32_t minor;
+};
+#define BINDER_CTL_ADD _IOWR(BINDER_IOCTL_TYPE, 1, struct procroot_binderfs_device)
+#define IS_BINDER_CTL(req) (((req >> 8) & 0xff) == BINDER_IOCTL_TYPE && \
+	((req & 0xff) == 1) && (((req >> 16) & 0x3fff) > sizeof(struct binder_write_read)))
 #define MAX_BINDER_FDS 64
 #define MAX_BINDER_QUEUE 64
 #define MAX_BINDER_REPLY_WORDS 256
@@ -149,16 +160,27 @@ static struct {
 	size_t count;
 	BinderEndpoint *context_manager[BINDER_DOMAIN_COUNT];
 } binder_broker;
+static uint32_t binderfs_next_minor;
+static bool binderfs_allocated[BINDER_DOMAIN_COUNT];
 
 static FilteredSysnum filtered_sysnums[] = {
 	{ PR_open, FILTER_SYSEXIT }, { PR_openat, FILTER_SYSEXIT },
 	{ PR_openat2, FILTER_SYSEXIT }, { PR_ioctl, FILTER_SYSEXIT },
+	{ PR_x32_ioctl, FILTER_SYSEXIT },
 	{ PR_mmap, FILTER_SYSEXIT }, { PR_mmap2, FILTER_SYSEXIT },
 	{ PR_mknod, FILTER_SYSEXIT }, { PR_mknodat, FILTER_SYSEXIT },
 	{ PR_close, 0 }, FILTERED_SYSNUM_END,
 };
 static enum BinderDomain binder_domain(const char *p)
 {
+	const char *name = strrchr(p, '/');
+	name = name == NULL ? p : name + 1;
+	if (strcmp(name, "hwbinder") == 0)
+		return BINDER_DOMAIN_HWBINDER;
+	if (strcmp(name, "vndbinder") == 0)
+		return BINDER_DOMAIN_VNDBINDER;
+	if (strcmp(name, "binder") == 0 || strcmp(name, "binder-control") == 0)
+		return BINDER_DOMAIN_BINDER;
 	if (strcmp(p, "/dev/hwbinder") == 0)
 		return BINDER_DOMAIN_HWBINDER;
 	if (strcmp(p, "/dev/vndbinder") == 0)
@@ -499,10 +521,33 @@ int binder_callback(Extension *e, ExtensionEvent event, intptr_t data1, intptr_t
 		c = talloc_get_type_abort(e->config, BinderConfig);
 		c->last_domain = binder_domain((const char *)data2);
 		c->last_binder_path = c->last_domain != BINDER_DOMAIN_NONE;
-		if (c->last_binder_path) { strcpy((char *)data1, "/dev/null"); return 1; }
+		if (c->last_binder_path) {
+			const char *slash = strrchr((const char *)data2, '/');
+			const char *name = slash == NULL ? (const char *)data2 : slash + 1;
+			/* binder_alloc probes each device before issuing BINDER_CTL_ADD.
+			 * An unallocated name must therefore not resolve to /dev/null,
+			 * while an allocated device must remain openable by the broker. */
+			if (strcmp(name, "binder-control") == 0 ||
+			    (c->last_domain >= 0 && binderfs_allocated[c->last_domain])) {
+				strcpy((char *)data1, "/dev/null");
+			}
+			else
+				strcpy((char *)data1, "/dev/shm/procroot-binder-missing");
+			return 1;
+		}
 		return 0;
 	case SYSCALL_ENTER_START:
 		c = talloc_get_type_abort(e->config, BinderConfig); s = get_sysnum(t, ORIGINAL);
+
+		if (s == PR_reboot || s == PR_shutdown)
+			return -EPERM;
+		/* ueventd's kernel netlink stream is a host-global interface.  A
+		 * guest listener sees unrelated host events and can spin forever;
+		 * Binder mode supplies a device namespace without exposing it. */
+		if (s == PR_socket &&
+		    peek_reg(t, CURRENT, SYSARG_1) == AF_NETLINK &&
+		    peek_reg(t, CURRENT, SYSARG_3) == NETLINK_KOBJECT_UEVENT)
+			return -EAFNOSUPPORT;
 		if (s == PR_mmap || s == PR_mmap2) {
 			int fd = (int)peek_reg(t, CURRENT, SYSARG_5);
 			BinderFd *f = find_fd(c, fd);
@@ -512,17 +557,49 @@ int binder_callback(Extension *e, ExtensionEvent event, intptr_t data1, intptr_t
 				poke_reg(t, SYSARG_4, flags | MAP_ANONYMOUS);
 			}
 		}
-		if (s == PR_ioctl) {
-			int fd = (int)peek_reg(t, CURRENT, SYSARG_1); unsigned long req = (unsigned long)peek_reg(t, CURRENT, SYSARG_2);
+		if (s == PR_ioctl || s == PR_x32_ioctl) {
+			int fd = (int)peek_reg(t, CURRENT, SYSARG_1);
+			unsigned long req = (unsigned long)peek_reg(t, CURRENT, SYSARG_2);
 			BinderFd *f = find_fd(c, fd);
-			if (f && ((req >> 8) & 0xff) == BINDER_IOCTL_TYPE) {
-				c->ioctl_pending = true; c->pending_fd = fd; c->pending_request = req; set_sysnum(t, PR_getpid);
+			if (((req >> 8) & 0xff) == BINDER_IOCTL_TYPE || IS_BINDER_CTL(req)) {
+				if (f == NULL) {
+					remember_fd(c, fd, BINDER_DOMAIN_BINDER);
+					f = find_fd(c, fd);
+				}
+				c->ioctl_pending = true; c->pending_fd = fd; c->pending_request = req;
+			set_sysnum(t, PR_getpid);
 			}
 		}
 		if (s == PR_close) forget_fd(c, (int)peek_reg(t, CURRENT, SYSARG_1));
 		return 0;
+	case SYSCALL_EXIT_START:
+		c = talloc_get_type_abort(e->config, BinderConfig); s = get_sysnum(t, ORIGINAL);
+		if ((s == PR_ioctl || s == PR_x32_ioctl) && !c->ioctl_pending) {
+			int fd = (int)peek_reg(t, CURRENT, SYSARG_1);
+			unsigned long req = (unsigned long)peek_reg(t, CURRENT, SYSARG_2);
+			BinderFd *f = find_fd(c, fd);
+			if (((req >> 8) & 0xff) == BINDER_IOCTL_TYPE || IS_BINDER_CTL(req)) {
+				if (f == NULL) {
+					remember_fd(c, fd, BINDER_DOMAIN_BINDER);
+					f = find_fd(c, fd);
+				}
+			c->ioctl_pending = true;
+			c->pending_fd = fd;
+			c->pending_request = req;
+			}
+		}
+		return 0;
 	case SYSCALL_EXIT_END:
 		c = talloc_get_type_abort(e->config, BinderConfig); s = get_sysnum(t, ORIGINAL);
+		if ((s == PR_ioctl || s == PR_x32_ioctl) && !c->ioctl_pending) {
+			int fd = (int) peek_reg(t, CURRENT, SYSARG_1);
+			unsigned long req = peek_reg(t, CURRENT, SYSARG_2);
+			if (find_fd(c, fd) || IS_BINDER_CTL(req)) {
+				c->ioctl_pending = true;
+				c->pending_fd = fd;
+				c->pending_request = req;
+			}
+		}
 		if ((s == PR_open || s == PR_openat || s == PR_openat2) && c->last_binder_path) {
 			if ((long)peek_reg(t, CURRENT, SYSARG_RESULT) >= 0) remember_fd(c, (int)peek_reg(t, CURRENT, SYSARG_RESULT), c->last_domain);
 			c->last_binder_path = false;
@@ -532,10 +609,41 @@ int binder_callback(Extension *e, ExtensionEvent event, intptr_t data1, intptr_t
 				result(t, 0);
 			c->last_binder_path = false;
 		}
-		if (c->ioctl_pending && s == PR_ioctl) {
+		/* The enter handler replaces Binder ioctl with getpid so the host
+		 * never executes the ioctl.  Therefore ORIGINAL is no longer an
+		 * ioctl at exit; the pending flag is the authoritative marker. */
+		if (c->ioctl_pending) {
+
 			BinderFd *f = find_fd(c, c->pending_fd); long r = 0; word_t arg = peek_reg(t, CURRENT, SYSARG_3);
 			if (!f) r = -EBADF;
-			else if (c->pending_request == BINDER_VERSION) { struct binder_version v = { BINDER_CURRENT_PROTOCOL_VERSION }; if (write_data(t, arg, &v, sizeof(v)) < 0) r = -EFAULT; }
+			else if (IS_BINDER_CTL(c->pending_request)) {
+				struct procroot_binderfs_device device;
+				if (read_data(t, &device, arg, sizeof(device)) < 0)
+					r = -EFAULT;
+				else if (device.name[0] == '\0' ||
+					strnlen(device.name, sizeof(device.name)) == sizeof(device.name))
+					r = -EINVAL;
+				else {
+					/* BinderFS nodes are represented by the userspace Binder
+					 * broker, not host device nodes.  Return harmless stable
+					 * numbers so binder_alloc can create its guest names. */
+					device.major = 511;
+					device.minor = binderfs_next_minor++;
+					if (strcmp(device.name, "binder") == 0)
+						binderfs_allocated[BINDER_DOMAIN_BINDER] = true;
+					else if (strcmp(device.name, "hwbinder") == 0)
+						binderfs_allocated[BINDER_DOMAIN_HWBINDER] = true;
+					else if (strcmp(device.name, "vndbinder") == 0)
+						binderfs_allocated[BINDER_DOMAIN_VNDBINDER] = true;
+					if (write_data(t, arg, &device, sizeof(device)) < 0)
+						r = -EFAULT;
+				}
+			}
+			else if (c->pending_request == BINDER_VERSION) {
+				struct binder_version v = { BINDER_CURRENT_PROTOCOL_VERSION };
+				int wr = write_data(t, arg, &v, sizeof(v));
+				if (wr < 0) r = -EFAULT;
+			}
 			else if (c->pending_request == BINDER_SET_MAX_THREADS) { uint32_t n; if (read_data(t, &n, arg, sizeof(n)) < 0) r = -EFAULT; else f->max_threads = n; }
 			else if (c->pending_request == BINDER_SET_CONTEXT_MGR ||
 				 c->pending_request == BINDER_SET_CONTEXT_MGR_EXT) {
