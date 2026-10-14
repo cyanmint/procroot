@@ -1,0 +1,55 @@
+name: Copilot Setup Steps
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 59
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install QEMU AArch64 user emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-user
+          command -v qemu-aarch64
+          qemu-aarch64 --version
+
+      - name: Pull Redroid 9 ARM64 image
+        run: |
+          docker pull --platform=linux/arm64 redroid/redroid:9.0.0-latest
+          docker image inspect --format '{{.Os}}/{{.Architecture}}' redroid/redroid:9.0.0-latest | grep -Fx 'linux/arm64'
+          # Keep the short image name requested by the local test setup.
+          docker tag redroid/redroid:9.0.0-latest redroid:9.0.0-latest
+
+      - name: Export image filesystem to the redroid9 rootfs
+        env:
+          IMAGE: redroid:9.0.0-latest
+        run: |
+          set -euo pipefail
+          container=redroid9-rootfs-export
+          rootfs="$(dirname "$GITHUB_WORKSPACE")/redroid9"
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker create --platform=linux/arm64 --name "$container" "$IMAGE" >/dev/null
+          rm -rf -- "$rootfs"
+          mkdir -p "$rootfs"
+          docker export "$container" | tar --extract --file=- --directory "$rootfs" \
+            --numeric-owner --no-same-owner --xattrs --xattrs-include='*'
+          test -x "$rootfs/init"
+          printf 'Rootfs exported to %s\n' "$rootfs"
+          du -sh "$rootfs"
