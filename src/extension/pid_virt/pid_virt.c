@@ -180,6 +180,19 @@ typedef struct {
 	word_t open_redirect_target_addr;
 } Config;
 
+/* A child can exit and its Tracee be freed before the guest parent
+ * calls waitid().  Keep the host-to-guest mapping until that wait is
+ * consumed so P_ALL/P_PGID results still expose the virtual PID.  */
+typedef struct {
+	pid_t host_pid;
+	uint64_t vpid;
+	uint64_t parent_tgid_vpid;
+} ChildPidMapping;
+
+static ChildPidMapping *child_pid_mappings;
+static size_t child_pid_mapping_count;
+static size_t child_pid_mapping_capacity;
+
 /**
  * Return true if a pending binding targets the host "/proc" or
  * "/sys" directory, which conflicts with "-N"/"--proc" (PID/sysfs
@@ -470,6 +483,77 @@ static uint64_t host_pid_to_vpid(pid_t pid)
 {
 	Tracee *target = get_tracee(NULL, pid, false);
 	return target != NULL ? target->vpid : (uint64_t) pid;
+}
+
+static void remember_child_pid(Tracee *tracee, uint64_t parent_tgid_vpid,
+			       pid_t host_pid, uint64_t vpid)
+{
+	ChildPidMapping *new_mappings;
+	size_t i;
+
+	if (host_pid <= 0)
+		return;
+
+	/* A reused host PID replaces any stale mapping left by a child
+	 * reaped through a wait API other than waitid().  */
+	for (i = 0; i < child_pid_mapping_count; i++) {
+		if (child_pid_mappings[i].host_pid == host_pid) {
+			child_pid_mappings[i].vpid = vpid;
+			child_pid_mappings[i].parent_tgid_vpid = parent_tgid_vpid;
+			return;
+		}
+	}
+
+	if (child_pid_mapping_count == child_pid_mapping_capacity) {
+		size_t capacity = child_pid_mapping_capacity == 0
+			? 16 : child_pid_mapping_capacity * 2;
+
+		new_mappings = talloc_realloc(NULL, child_pid_mappings,
+					      ChildPidMapping, capacity);
+		if (new_mappings == NULL) {
+			note(tracee, WARNING, SYSTEM, "running out of memory");
+			return;
+		}
+		child_pid_mappings = new_mappings;
+		child_pid_mapping_capacity = capacity;
+	}
+
+	child_pid_mappings[child_pid_mapping_count++] = (ChildPidMapping) {
+		.host_pid = host_pid,
+		.vpid = vpid,
+		.parent_tgid_vpid = parent_tgid_vpid,
+	};
+}
+
+static uint64_t child_host_pid_to_vpid(uint64_t parent_tgid_vpid, pid_t host_pid)
+{
+	size_t i;
+
+	for (i = 0; i < child_pid_mapping_count; i++) {
+		if (child_pid_mappings[i].host_pid == host_pid
+		    && child_pid_mappings[i].parent_tgid_vpid == parent_tgid_vpid)
+			return child_pid_mappings[i].vpid;
+	}
+
+	return host_pid_to_vpid(host_pid);
+}
+
+static void forget_child_pid(uint64_t parent_tgid_vpid, pid_t host_pid)
+{
+	size_t i;
+
+	for (i = 0; i < child_pid_mapping_count; i++) {
+		if (child_pid_mappings[i].host_pid != host_pid
+		    || child_pid_mappings[i].parent_tgid_vpid != parent_tgid_vpid)
+			continue;
+
+		child_pid_mappings[i] = child_pid_mappings[--child_pid_mapping_count];
+		if (child_pid_mapping_count == 0) {
+			TALLOC_FREE(child_pid_mappings);
+			child_pid_mapping_capacity = 0;
+		}
+		return;
+	}
 }
 
 static void handle_getdents64_exit(Tracee *tracee, Config *config)
@@ -915,7 +999,7 @@ static void write_back_tid(Tracee *tracee, word_t addr, uint64_t vpid)
  * clone(2), write back the vPID/vTID into CLONE_PARENT_SETTID /
  * CLONE_CHILD_SETTID target addresses.
  */
-static void handle_clone_exit(Tracee *tracee, Sysnum sysnum)
+static void handle_clone_exit(Tracee *tracee, Config *config, Sysnum sysnum)
 {
 	int64_t result;
 	Tracee *child;
@@ -927,6 +1011,8 @@ static void handle_clone_exit(Tracee *tracee, Sysnum sysnum)
 	child = get_tracee(tracee, (pid_t) result, false);
 	if (child == NULL)
 		return;
+
+	remember_child_pid(tracee, config->tgid_vpid, child->pid, child->vpid);
 
 	poke_reg(tracee, SYSARG_RESULT, (word_t) child->vpid);
 
@@ -954,11 +1040,13 @@ static void handle_clone_exit(Tracee *tracee, Sysnum sysnum)
 	}
 }
 
-static void handle_waitid_exit(Tracee *tracee)
+static void handle_waitid_exit(Tracee *tracee, Config *config)
 {
 	word_t info_addr;
 	siginfo_t info;
 	int64_t result = (int64_t) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	pid_t host_pid;
+	word_t options;
 
 	if (result != 0)
 		return;
@@ -970,12 +1058,20 @@ static void handle_waitid_exit(Tracee *tracee)
 	if (info.si_pid <= 0)
 		return; /* WNOHANG, or no child status was returned.  */
 
+	host_pid = info.si_pid;
+	options = peek_reg(tracee, ORIGINAL, SYSARG_4);
+
 	if (peek_reg(tracee, ORIGINAL, SYSARG_1) == P_PID)
 		info.si_pid = (pid_t) peek_reg(tracee, ORIGINAL, SYSARG_2);
 	else
-		info.si_pid = (pid_t) host_pid_to_vpid(info.si_pid);
+		info.si_pid = (pid_t) child_host_pid_to_vpid(config->tgid_vpid, host_pid);
 
 	(void) write_data(tracee, info_addr, &info, sizeof(info));
+
+	if ((options & WNOWAIT) == 0
+	    && (info.si_code == CLD_EXITED || info.si_code == CLD_KILLED
+		|| info.si_code == CLD_DUMPED))
+		forget_child_pid(config->tgid_vpid, host_pid);
 }
 
 static void handle_sysexit(Tracee *tracee, Config *config)
@@ -1008,11 +1104,11 @@ static void handle_sysexit(Tracee *tracee, Config *config)
 	case PR_clone3:
 	case PR_fork:
 	case PR_vfork:
-		handle_clone_exit(tracee, sysnum);
+		handle_clone_exit(tracee, config, sysnum);
 		break;
 
 	case PR_waitid:
-		handle_waitid_exit(tracee);
+		handle_waitid_exit(tracee, config);
 		break;
 
 	case PR_getdents64:
