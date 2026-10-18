@@ -27,9 +27,11 @@
 #include <errno.h>       /* E*, */
 #include <ctype.h>       /* isdigit(3), */
 #include <inttypes.h>    /* PRIu64, */
+#include <stddef.h>      /* offsetof(3), */
 #include <fcntl.h>       /* O_*, AT_FDCWD, */
 #include <linux/sched.h> /* CLONE_*, */
 #include <signal.h>      /* siginfo_t, */
+#include <sys/ptrace.h>  /* PTRACE_GETSIGINFO, PTRACE_SETSIGINFO, */
 #include <sys/wait.h>    /* P_PID, P_PGID, */
 
 #include "extension/extension.h"
@@ -511,6 +513,32 @@ static uint64_t host_pid_to_vpid(pid_t pid)
 {
 	Tracee *target = get_tracee(NULL, pid, false);
 	return target != NULL ? target->vpid : (uint64_t) pid;
+}
+
+static void handle_signal_info(Tracee *tracee, int status)
+{
+	siginfo_t info;
+	int saved_errno = errno;
+
+	if (!WIFSTOPPED(status))
+		return;
+	if (ptrace(PTRACE_GETSIGINFO, tracee->pid, NULL, &info) < 0) {
+		errno = saved_errno;
+		return;
+	}
+
+	/* User-generated signal info reports host PIDs.  Translate them
+	 * before delivery so PID-virtualized runtimes can validate their
+	 * sender identity (for example, glibc's setxid signal handler). */
+	if (info.si_code <= 0 && info.si_pid > 0) {
+		uint64_t vpid = host_pid_to_vpid(info.si_pid);
+
+		if (vpid != (uint64_t) info.si_pid) {
+			info.si_pid = (pid_t) vpid;
+			(void) ptrace(PTRACE_SETSIGINFO, tracee->pid, NULL, &info);
+		}
+	}
+	errno = saved_errno;
 }
 
 static void remember_child_pid(Tracee *tracee, uint64_t parent_tgid_vpid,
@@ -1064,7 +1092,26 @@ static void handle_clone_exit(Tracee *tracee, Config *config, Sysnum sysnum)
 			write_back_tid(tracee, parent_tidptr, child->vpid);
 
 		if ((flags & CLONE_CHILD_SETTID) != 0)
-			write_back_tid(tracee, child_tidptr, child->vpid);
+			write_back_tid(child, child_tidptr, child->vpid);
+	}
+	else if (sysnum == PR_clone3) {
+		struct clone_args args = {};
+		word_t args_addr = peek_reg(tracee, ORIGINAL, SYSARG_1);
+		word_t args_size = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		size_t required_size = offsetof(struct clone_args, exit_signal);
+
+		/* The first four fields are present in every supported
+		 * clone3() version.  Read only those fields so older callers
+		 * with a shorter struct are not over-read. */
+		if (args_size < required_size ||
+		    read_data(tracee, &args, args_addr, required_size) < 0)
+			return;
+
+		if ((args.flags & CLONE_PARENT_SETTID) != 0)
+			write_back_tid(tracee, (word_t) args.parent_tid, child->vpid);
+
+		if ((args.flags & CLONE_CHILD_SETTID) != 0)
+			write_back_tid(child, (word_t) args.child_tid, child->vpid);
 	}
 }
 
@@ -1360,6 +1407,10 @@ int pid_virt_callback(Extension *extension, ExtensionEvent event,
 		}
 		return 0;
 	}
+
+	case NEW_STATUS:
+		handle_signal_info(TRACEE(extension), (int) data1);
+		return 0;
 
 	default:
 		return 0;

@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <grp.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -383,6 +385,55 @@ static void check_fork_child_vpid(void)
 		child_vpid > 0 && child_vpid != getpid(), detail);
 }
 
+static void *setgroups_barrier_thread(void *arg)
+{
+	pthread_barrier_t *barrier = arg;
+
+	(void) pthread_barrier_wait(barrier);
+	(void) pthread_barrier_wait(barrier);
+	return NULL;
+}
+
+static void check_multithreaded_setgroups(void)
+{
+	pthread_barrier_t barrier;
+	pthread_t thread;
+	gid_t group = 0;
+	int rc;
+	int saved_errno;
+	char detail[128];
+
+	if (pthread_barrier_init(&barrier, NULL, 2) != 0) {
+		check("multithreaded setgroups completes", 0,
+		      "pthread_barrier_init() failed");
+		return;
+	}
+	if (pthread_create(&thread, NULL, setgroups_barrier_thread,
+			   &barrier) != 0) {
+		pthread_barrier_destroy(&barrier);
+		check("multithreaded setgroups completes", 0,
+		      "pthread_create() failed");
+		return;
+	}
+
+	(void) pthread_barrier_wait(&barrier);
+	/* glibc synchronizes credential changes across threads with a
+	 * signal-based protocol that validates the sender PID.  PID and
+	 * signal-info virtualization must both preserve that identity. */
+	alarm(10);
+	errno = 0;
+	rc = setgroups(1, &group);
+	saved_errno = errno;
+	alarm(0);
+	(void) pthread_barrier_wait(&barrier);
+	pthread_join(thread, NULL);
+	pthread_barrier_destroy(&barrier);
+
+	snprintf(detail, sizeof(detail), "rc=%d errno=%d", rc, saved_errno);
+	check("multithreaded setgroups completes",
+	      rc == 0 || (rc == -1 && saved_errno == EPERM), detail);
+}
+
 int main(void)
 {
 	printf("=== PRoot PID-namespace ('-N'/'--proc') checker ===\n");
@@ -398,6 +449,7 @@ int main(void)
 	check_sys_write_spoof();
 	check_kill_self();
 	check_fork_child_vpid();
+	check_multithreaded_setgroups();
 
 	printf("=== %d/%d checks passed ===\n", nb_checks - nb_failures, nb_checks);
 
