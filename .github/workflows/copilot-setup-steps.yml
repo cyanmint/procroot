@@ -1,13 +1,7 @@
 name: Copilot Setup Steps
 
 on:
-  workflow_dispatch:
-  push:
-    paths:
-      - .github/workflows/copilot-setup-steps.yml
-  pull_request:
-    paths:
-      - .github/workflows/copilot-setup-steps.yml
+  workflow_call:
 
 jobs:
   copilot-setup-steps:
@@ -23,17 +17,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes qemu-user qemu-system-arm gcc-aarch64-linux-gnu unzip
-          sudo dpkg --add-architecture arm64
-          . /etc/os-release
-          printf 'deb [arch=arm64] https://ports.ubuntu.com/ubuntu-ports %s main universe\n' \
-            "$UBUNTU_CODENAME" "$UBUNTU_CODENAME-updates" "$UBUNTU_CODENAME-security" \
-            | sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list
-          sudo apt-get \
-            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu-ports-arm64.list \
-            -o Dir::Etc::sourceparts=- \
-            -o APT::Architecture=arm64 \
-            -o APT::Architectures=arm64 \
-            update
           sudo apt-get install --yes libtalloc-dev:arm64
           command -v qemu-aarch64
           command -v qemu-system-aarch64
