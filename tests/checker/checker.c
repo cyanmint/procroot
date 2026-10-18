@@ -434,6 +434,53 @@ static void check_multithreaded_setgroups(void)
 	      rc == 0 || (rc == -1 && saved_errno == EPERM), detail);
 }
 
+static long read_integer_file(const char *path)
+{
+	char value[16];
+	char *end;
+	size_t total = 0;
+	int fd = open(path, O_RDONLY);
+
+	if (fd < 0)
+		return -1;
+	if (lseek(fd, 0, SEEK_SET) < 0) {
+		close(fd);
+		return -1;
+	}
+	while (total < sizeof(value) - 1) {
+		ssize_t count = read(fd, value + total, 1);
+		if (count < 0) {
+			close(fd);
+			return -1;
+		}
+		if (count == 0)
+			break;
+		total += (size_t) count;
+	}
+	close(fd);
+	if (total == 0)
+		return -1;
+
+	value[total] = '\0';
+	long result = strtol(value, &end, 10);
+	while (isspace((unsigned char) *end))
+		end++;
+	return end == value || *end != '\0' ? -1 : result;
+}
+
+static void check_mmap_rnd_bits(void)
+{
+	long bits = read_integer_file("/proc/sys/vm/mmap_rnd_bits");
+	long compat_bits = read_integer_file("/proc/sys/vm/mmap_rnd_compat_bits");
+	long kptr_restrict = read_integer_file("/proc/sys/kernel/kptr_restrict");
+	char detail[128];
+
+	snprintf(detail, sizeof(detail), "native=%ld compat=%ld kptr_restrict=%ld",
+		 bits, compat_bits, kptr_restrict);
+	check("Android startup sysctls report required values",
+	      bits >= 24 && compat_bits >= 16 && kptr_restrict >= 2, detail);
+}
+
 int main(void)
 {
 	printf("=== PRoot PID-namespace ('-N'/'--proc') checker ===\n");
@@ -450,6 +497,7 @@ int main(void)
 	check_kill_self();
 	check_fork_child_vpid();
 	check_multithreaded_setgroups();
+	check_mmap_rnd_bits();
 
 	printf("=== %d/%d checks passed ===\n", nb_checks - nb_failures, nb_checks);
 
