@@ -19,12 +19,68 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install QEMU AArch64 user emulator
+      - name: Install QEMU and AArch64 build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes qemu-user
+          sudo apt-get install --yes qemu-user qemu-system-arm gcc-aarch64-linux-gnu unzip
+          sudo dpkg --add-architecture arm64
+          . /etc/os-release
+          printf 'deb [arch=arm64] https://ports.ubuntu.com/ubuntu-ports %s main universe\n' \
+            "$UBUNTU_CODENAME" "$UBUNTU_CODENAME-updates" "$UBUNTU_CODENAME-security" \
+            | sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list
+          sudo apt-get \
+            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu-ports-arm64.list \
+            -o Dir::Etc::sourceparts=- \
+            -o APT::Architecture=arm64 \
+            -o APT::Architectures=arm64 \
+            update
+          sudo apt-get install --yes libtalloc-dev:arm64
           command -v qemu-aarch64
+          command -v qemu-system-aarch64
+          command -v aarch64-linux-gnu-gcc
           qemu-aarch64 --version
+          qemu-system-aarch64 --version
+          aarch64-linux-gnu-gcc --version
+
+      - name: Download and extract Android 17 GKI kernel
+        env:
+          GKI_URL: https://dl.google.com/android/gki/gki-certified-boot-android17-6.18-2026-09_r1.zip
+          GKI_ZIP_SHA256: d9035a86e18d18817979b8fa48e198f2033fd1b3018e380a8c7e959289bc59f3
+          GKI_IMAGE_SHA256: 9f2fc4dd593652eacb9587a275e53a9ef8f651d60e23609b337db50600b9137a
+        run: |
+          set -euo pipefail
+          gki_dir="${RUNNER_TEMP}/gki"
+          gki_zip="${gki_dir}/gki-certified-boot-android17-6.18-2026-09_r1.zip"
+          boot_image="${gki_dir}/boot-6.18.img"
+          kernel_image="${gki_dir}/Image"
+          mkdir -p "$gki_dir"
+          curl --fail --location --retry 3 --output "$gki_zip" "$GKI_URL"
+          echo "$GKI_ZIP_SHA256  $gki_zip" | sha256sum --check
+          unzip -p "$gki_zip" boot-6.18.img > "$boot_image"
+          python3 - "$boot_image" "$kernel_image" <<'PY'
+          import pathlib
+          import struct
+          import sys
+
+          boot_path, kernel_path = map(pathlib.Path, sys.argv[1:])
+          boot = boot_path.read_bytes()
+          if boot[:8] != b"ANDROID!":
+              raise SystemExit("unexpected Android boot image magic")
+          kernel_size = struct.unpack_from("<I", boot, 8)[0]
+          header_version = struct.unpack_from("<I", boot, 40)[0]
+          if header_version != 4:
+              raise SystemExit(f"expected boot image header v4, got v{header_version}")
+          kernel_offset = 4096
+          kernel_end = kernel_offset + kernel_size
+          if kernel_size == 0 or kernel_end > len(boot):
+              raise SystemExit("invalid kernel payload size")
+          kernel = boot[kernel_offset:kernel_end]
+          if kernel[56:60] != b"ARM\x64":
+              raise SystemExit("extracted payload is not an ARM64 Image")
+          kernel_path.write_bytes(kernel)
+          PY
+          echo "$GKI_IMAGE_SHA256  $kernel_image" | sha256sum --check
+          file "$kernel_image"
 
       - name: Pull Redroid 9 ARM64 image
         run: |
