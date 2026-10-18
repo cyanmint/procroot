@@ -27,9 +27,11 @@
 #include <errno.h>       /* E*, */
 #include <ctype.h>       /* isdigit(3), */
 #include <inttypes.h>    /* PRIu64, */
+#include <stddef.h>      /* offsetof(3), */
 #include <fcntl.h>       /* O_*, AT_FDCWD, */
 #include <linux/sched.h> /* CLONE_*, */
 #include <signal.h>      /* siginfo_t, */
+#include <sys/ptrace.h>  /* PTRACE_GETSIGINFO, PTRACE_SETSIGINFO, */
 #include <sys/wait.h>    /* P_PID, P_PGID, */
 
 #include "extension/extension.h"
@@ -63,6 +65,7 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_sched_getaffinity,	0 },
 	{ PR_getdents64,	FILTER_SYSEXIT },
 	{ PR_read,		FILTER_SYSEXIT },
+	{ PR_lseek,		FILTER_SYSEXIT },
 	{ PR_readlink,		FILTER_SYSEXIT },
 	{ PR_readlinkat,	FILTER_SYSEXIT },
 	{ PR_openat,		FILTER_SYSEXIT },
@@ -128,12 +131,15 @@ typedef enum {
 	PROC_FD_STAT,    /* fd opened on "/proc/<pid>/stat".           */
 	PROC_FD_STATM,   /* fd opened on "/proc/<pid>/statm".          */
 	SYS_FD_GENERIC,  /* fd opened somewhere under "/sys".          */
+	PROC_FD_SYSCTL, /* Android startup sysctl compatibility. */
 } ProcFdKind;
 
 typedef struct {
 	int fd;
 	pid_t host_pid; /* Meaningful for STATUS/STAT/STATM only.  */
 	ProcFdKind kind;
+	size_t offset;
+	int value;
 } TrackedFd;
 
 typedef struct {
@@ -151,6 +157,7 @@ typedef struct {
 	 * open(at)(2), to remember what kind of /proc entry was just
 	 * opened.  */
 	bool last_path_is_proc;
+	int last_path_proc_sys_value;
 	bool last_path_is_root;
 	pid_t last_path_host_pid;
 	char last_path_leaf[32];
@@ -173,6 +180,7 @@ typedef struct {
 	 * consumed by the SYSCALL_CHAINED_EXIT handler to finish the
 	 * fd-tracking spoofing.  */
 	bool open_redirect_pending;
+	int open_redirect_proc_sys_value;
 
 	/* Address, in the tracee's memory, of a pre-written
 	 * FAKE_OPEN_TARGET path, reserved at sysenter (see
@@ -219,6 +227,7 @@ bool pid_virt_binding_conflicts(Tracee *tracee)
 static void reset_last_path(Config *config)
 {
 	config->last_path_is_proc = false;
+	config->last_path_proc_sys_value = 0;
 	config->last_path_is_root = false;
 	config->last_path_host_pid = 0;
 	config->last_path_leaf[0] = '\0';
@@ -258,6 +267,18 @@ static void track_fd(Config *config, int fd, pid_t host_pid, ProcFdKind kind)
 	config->fds[free_slot].fd = fd;
 	config->fds[free_slot].host_pid = host_pid;
 	config->fds[free_slot].kind = kind;
+	config->fds[free_slot].offset = 0;
+	config->fds[free_slot].value = 0;
+}
+
+static void track_proc_sys_fd(Config *config, int fd, int value)
+{
+	TrackedFd *tracked;
+
+	track_fd(config, fd, 0, PROC_FD_SYSCTL);
+	tracked = find_tracked_fd(config, fd);
+	if (tracked != NULL)
+		tracked->value = value;
 }
 
 static void untrack_fd(Config *config, int fd)
@@ -300,6 +321,13 @@ static int rewrite_proc_path(Tracee *tracee UNUSED, Config *config,
 
 	if (strncmp(full, "/proc/", 6) != 0)
 		return 0;
+
+	if (strcmp(full, "/proc/sys/vm/mmap_rnd_bits") == 0)
+		config->last_path_proc_sys_value = 24;
+	else if (strcmp(full, "/proc/sys/vm/mmap_rnd_compat_bits") == 0)
+		config->last_path_proc_sys_value = 16;
+	else if (strcmp(full, "/proc/sys/kernel/kptr_restrict") == 0)
+		config->last_path_proc_sys_value = 2;
 
 	rest = full + 6;
 	slash = strchr(rest, '/');
@@ -511,6 +539,32 @@ static uint64_t host_pid_to_vpid(pid_t pid)
 {
 	Tracee *target = get_tracee(NULL, pid, false);
 	return target != NULL ? target->vpid : (uint64_t) pid;
+}
+
+static void handle_signal_info(Tracee *tracee, int status)
+{
+	siginfo_t info;
+	int saved_errno = errno;
+
+	if (!WIFSTOPPED(status))
+		return;
+	if (ptrace(PTRACE_GETSIGINFO, tracee->pid, NULL, &info) < 0) {
+		errno = saved_errno;
+		return;
+	}
+
+	/* User-generated signal info reports host PIDs.  Translate them
+	 * before delivery so PID-virtualized runtimes can validate their
+	 * sender identity (for example, glibc's setxid signal handler). */
+	if (info.si_code <= 0 && info.si_pid > 0) {
+		uint64_t vpid = host_pid_to_vpid(info.si_pid);
+
+		if (vpid != (uint64_t) info.si_pid) {
+			info.si_pid = (pid_t) vpid;
+			(void) ptrace(PTRACE_SETSIGINFO, tracee->pid, NULL, &info);
+		}
+	}
+	errno = saved_errno;
 }
 
 static void remember_child_pid(Tracee *tracee, uint64_t parent_tgid_vpid,
@@ -738,14 +792,42 @@ static void handle_read_exit(Tracee *tracee, Config *config)
 	TrackedFd *tracked;
 	word_t buf_addr;
 	int64_t result;
+	word_t requested;
 	char *inbuf, *outbuf;
 	size_t out_len;
+
+	fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
+	tracked = find_tracked_fd(config, fd);
+	if (tracked != NULL && tracked->kind == PROC_FD_SYSCTL) {
+		char value[16];
+		int value_length;
+		size_t length;
+		size_t count;
+
+		value_length = snprintf(value, sizeof(value), "%d\n", tracked->value);
+		if (value_length <= 0 || (size_t) value_length >= sizeof(value))
+			return;
+		length = (size_t) value_length;
+		requested = peek_reg(tracee, ORIGINAL, SYSARG_3);
+		if (requested == 0 || tracked->offset >= length) {
+			poke_reg(tracee, SYSARG_RESULT, 0);
+			return;
+		}
+
+		count = length - tracked->offset;
+		if (count > requested)
+			count = requested;
+		buf_addr = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		if (write_data(tracee, buf_addr, value + tracked->offset, count) == 0) {
+			tracked->offset += count;
+			poke_reg(tracee, SYSARG_RESULT, (word_t) count);
+		}
+		return;
+	}
 
 	if (peek_reg(tracee, CURRENT, SYSARG_RESULT) == (word_t) -1)
 		return;
 
-	fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
-	tracked = find_tracked_fd(config, fd);
 	if (tracked == NULL
 	    || (tracked->kind != PROC_FD_STATUS && tracked->kind != PROC_FD_STAT))
 		return;
@@ -839,6 +921,7 @@ static void prepare_open_redirect_target(Tracee *tracee, Config *config)
 	word_t addr;
 
 	config->open_redirect_target_addr = 0;
+	config->open_redirect_proc_sys_value = 0;
 
 	addr = alloc_mem(tracee, sizeof(FAKE_OPEN_TARGET));
 	if (addr == 0)
@@ -894,6 +977,7 @@ static void redirect_failed_sys_open(Tracee *tracee, Config *config, Sysnum sysn
 		return;
 
 	config->open_redirect_pending = true;
+	config->open_redirect_proc_sys_value = config->last_path_proc_sys_value;
 }
 
 static void handle_openat_exit(Tracee *tracee, Config *config)
@@ -905,7 +989,11 @@ static void handle_openat_exit(Tracee *tracee, Config *config)
 
 	if (config->last_path_is_sys) {
 		if (result >= 0) {
-			track_fd(config, (int) result, 0, SYS_FD_GENERIC);
+			if (config->last_path_proc_sys_value != 0)
+				track_proc_sys_fd(config, (int) result,
+						  config->last_path_proc_sys_value);
+			else
+				track_fd(config, (int) result, 0, SYS_FD_GENERIC);
 			return;
 		}
 
@@ -1064,7 +1152,26 @@ static void handle_clone_exit(Tracee *tracee, Config *config, Sysnum sysnum)
 			write_back_tid(tracee, parent_tidptr, child->vpid);
 
 		if ((flags & CLONE_CHILD_SETTID) != 0)
-			write_back_tid(tracee, child_tidptr, child->vpid);
+			write_back_tid(child, child_tidptr, child->vpid);
+	}
+	else if (sysnum == PR_clone3) {
+		struct clone_args args = {};
+		word_t args_addr = peek_reg(tracee, ORIGINAL, SYSARG_1);
+		word_t args_size = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		size_t required_size = offsetof(struct clone_args, exit_signal);
+
+		/* The first four fields are present in every supported
+		 * clone3() version.  Read only those fields so older callers
+		 * with a shorter struct are not over-read. */
+		if (args_size < required_size ||
+		    read_data(tracee, &args, args_addr, required_size) < 0)
+			return;
+
+		if ((args.flags & CLONE_PARENT_SETTID) != 0)
+			write_back_tid(tracee, (word_t) args.parent_tid, child->vpid);
+
+		if ((args.flags & CLONE_CHILD_SETTID) != 0)
+			write_back_tid(child, (word_t) args.child_tid, child->vpid);
 	}
 }
 
@@ -1174,6 +1281,18 @@ static void handle_sysexit(Tracee *tracee, Config *config)
 	case PR_read:
 		handle_read_exit(tracee, config);
 		break;
+
+	case PR_lseek: {
+		int fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
+		TrackedFd *tracked = find_tracked_fd(config, fd);
+
+		if (tracked != NULL && tracked->kind == PROC_FD_SYSCTL) {
+			int64_t result = (int64_t) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+			if (result >= 0)
+				tracked->offset = (size_t) result;
+		}
+		break;
+	}
 
 	case PR_readlink:
 	case PR_readlinkat:
@@ -1355,11 +1474,22 @@ int pid_virt_callback(Extension *extension, ExtensionEvent event,
 			int64_t result = (int64_t) peek_reg(tracee, CURRENT, SYSARG_RESULT);
 
 			config->open_redirect_pending = false;
-			if (result >= 0)
-				track_fd(config, (int) result, 0, SYS_FD_GENERIC);
+			if (result >= 0) {
+				if (config->open_redirect_proc_sys_value != 0)
+					track_proc_sys_fd(config, (int) result,
+						config->open_redirect_proc_sys_value);
+				else
+					track_fd(config, (int) result, 0,
+						 SYS_FD_GENERIC);
+			}
+			config->open_redirect_proc_sys_value = 0;
 		}
 		return 0;
 	}
+
+	case NEW_STATUS:
+		handle_signal_info(TRACEE(extension), (int) data1);
+		return 0;
 
 	default:
 		return 0;

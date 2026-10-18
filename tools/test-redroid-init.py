@@ -140,6 +140,8 @@ def main():
         else:
             copy_overlay(rootfs, guest, host)
         bindings.append((host, guest))
+    bindings.append((pathlib.Path("/dev/urandom"), "/dev/urandom"))
+    bindings.append((pathlib.Path("/dev/null"), "/dev/null"))
     (run_dir / "tmp").mkdir()
     bindings.append((run_dir / "tmp", "/tmp"))
     for label, guest in [("kmsg", "/dev/kmsg"), ("kmsg-debug", "/dev/kmsg_debug"),
