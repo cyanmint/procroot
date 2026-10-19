@@ -301,7 +301,7 @@ static void untrack_fd(Config *config, int fd)
  * Returns 1 if @full was a /proc path (in which case @result was
  * filled in), 0 if it isn't a /proc path, or a negative errno.
  */
-static int rewrite_proc_path(Tracee *tracee UNUSED, Config *config,
+static int rewrite_proc_path(Tracee *tracee, Config *config,
 			char result[PATH_MAX], const char *full)
 {
 	const char *rest;
@@ -321,6 +321,20 @@ static int rewrite_proc_path(Tracee *tracee UNUSED, Config *config,
 
 	if (strncmp(full, "/proc/", 6) != 0)
 		return 0;
+
+	/* An explicit guest binding must win over host /proc mirroring so
+	 * callers can provide a synthetic kernel command line.  Keep the
+	 * exception narrow: all other non-PID /proc paths still mirror the
+	 * host as before.  */
+	if (strcmp(full, "/proc/cmdline") == 0
+	    && tracee->fs->bindings.guest != NULL) {
+		Binding *binding;
+
+		CIRCLEQ_FOREACH(binding, tracee->fs->bindings.guest, link.guest) {
+			if (strcmp(binding->guest.path, full) == 0)
+				return 0;
+		}
+	}
 
 	if (strcmp(full, "/proc/sys/vm/mmap_rnd_bits") == 0)
 		config->last_path_proc_sys_value = 24;
