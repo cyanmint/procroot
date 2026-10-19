@@ -552,13 +552,20 @@ int binder_callback(Extension *e, ExtensionEvent event, intptr_t data1, intptr_t
 		c->last_domain = binder_domain((const char *)data2);
 		c->last_binder_path = c->last_domain != BINDER_DOMAIN_NONE;
 		if (c->last_binder_path) {
+			const char *path = (const char *)data2;
 			const char *slash = strrchr((const char *)data2, '/');
 			const char *name = slash == NULL ? (const char *)data2 : slash + 1;
-			/* binder_alloc probes each device before issuing BINDER_CTL_ADD.
-			 * An unallocated name must therefore not resolve to /dev/null,
-			 * while an allocated device must remain openable by the broker. */
+			bool binderfs_path = strncmp(path, "/dev/binderfs/", 14) == 0;
+			bool legacy_device = strcmp(path, "/dev/binder") == 0 ||
+				strcmp(path, "/dev/hwbinder") == 0 ||
+				strcmp(path, "/dev/vndbinder") == 0;
+			/* Legacy Binder nodes are always provided by the broker.
+			 * BinderFS nodes remain unavailable until BINDER_CTL_ADD
+			 * allocates the corresponding device. */
 			if (strcmp(name, "binder-control") == 0 ||
-			    (c->last_domain >= 0 && binderfs_allocated[c->last_domain])) {
+			    legacy_device ||
+			    (binderfs_path && c->last_domain >= 0 &&
+			     binderfs_allocated[c->last_domain])) {
 				strcpy((char *)data1, "/dev/null");
 			}
 			else
