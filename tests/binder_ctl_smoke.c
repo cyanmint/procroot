@@ -6,7 +6,9 @@
 #include <string.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
+#include <sys/vfs.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 struct binderfs_device {
 	char name[256];
@@ -30,6 +32,63 @@ struct binder_write_read {
 #define BINDER_CTL_ADD _IOWR('b', 1, struct binderfs_device)
 #define BINDER_VERSION _IOWR('b', 9, struct binder_version)
 #define BINDER_WRITE_READ _IOWR('b', 1, struct binder_write_read)
+
+#define TMPFS_MAGIC 0x01021994
+
+static int probe_tmpfs_path(const char *path)
+{
+	struct statfs fs;
+	char marker[] = "/dev/shm/procroot-shm-XXXXXX";
+	int fd;
+
+	if (statfs(path, &fs) < 0) {
+		perror(path);
+		return 1;
+	}
+	if ((unsigned long) fs.f_type != TMPFS_MAGIC) {
+		fprintf(stderr, "%s: expected tmpfs, got 0x%lx\n", path,
+			(unsigned long) fs.f_type);
+		return 2;
+	}
+	fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd < 0) {
+		perror(path);
+		return 3;
+	}
+	if (fstatfs(fd, &fs) < 0) {
+		perror("fstatfs");
+		close(fd);
+		return 4;
+	}
+	if ((unsigned long) fs.f_type != TMPFS_MAGIC) {
+		fprintf(stderr, "%s: fstatfs expected tmpfs, got 0x%lx\n", path,
+			(unsigned long) fs.f_type);
+		close(fd);
+		return 5;
+	}
+	close(fd);
+	printf("TMPFS_STATFS_FSTATFS path=%s\n", path);
+	if (strcmp(path, "/dev/shm") != 0)
+		return 0;
+
+	fd = mkstemp(marker);
+	if (fd < 0) {
+		perror("mkstemp(/dev/shm)");
+		return 6;
+	}
+	if (write(fd, "x", 1) != 1) {
+		perror("write(/dev/shm)");
+		close(fd);
+		unlink(marker);
+		return 7;
+	}
+	if (close(fd) < 0 || unlink(marker) < 0) {
+		perror("cleanup(/dev/shm)");
+		return 8;
+	}
+	printf("DEV_SHM=tmpfs,writable\n");
+	return 0;
+}
 
 static int probe_legacy_binder(const char *path)
 {
@@ -64,6 +123,14 @@ static int run_probe(void)
 	struct binder_version version = { .protocol_version = -1 };
 	struct binder_write_read bwr = { 0 };
 	int control, binder;
+	int status;
+
+	status = probe_tmpfs_path("/dev/shm");
+	if (status != 0)
+		return 14;
+	status = probe_tmpfs_path("/dev/__properties__");
+	if (status != 0)
+		return 15;
 
 	if (probe_legacy_binder("/dev/binder") != 0 ||
 	    probe_legacy_binder("/dev/hwbinder") != 0 ||

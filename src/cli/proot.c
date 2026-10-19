@@ -32,6 +32,7 @@
 extern int binder_callback(Extension *, ExtensionEvent, intptr_t, intptr_t);
 extern int pid_virt_callback(Extension *, ExtensionEvent, intptr_t, intptr_t);
 #include "path/binding.h"
+#include "path/temp.h"
 #include "attribute.h"
 
 /* These should be included last.  */
@@ -366,6 +367,8 @@ static int handle_option_port_switch(Tracee *tracee, const Cli *cli UNUSED, cons
 
 static int handle_option_binder(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
 {
+	const char *dev_shm;
+	const char *properties;
 	int status;
 
 	/* -B is the redroid environment: Android init needs a virtual PID
@@ -378,12 +381,29 @@ static int handle_option_binder(Tracee *tracee, const Cli *cli UNUSED, const cha
 	if (status < 0)
 		note(tracee, WARNING, INTERNAL, "binder not initialized");
 
-	/* Android's property service requires /dev/__properties__ to be a
-	 * tmpfs-backed area.  Bind only the host's empty tmpfs (/dev/shm), not
-	 * the host device tree; this lets init create its property files while
-	 * keeping ueventd isolated from host devices. */
-	if (new_binding(tracee, "/dev/shm", "/dev/__properties__", false) == NULL)
-		note(tracee, WARNING, INTERNAL, "redroid property area binding not initialized");
+	/* Second-stage init expects /dev/null to have been prepared by the
+	 * first stage.  Bind only this standard null device, not the host /dev
+	 * tree, which would expose unrelated host device state to ueventd. */
+	if (new_binding(tracee, "/dev/null", "/dev/null", true) == NULL) {
+		note(tracee, ERROR, USER, "can't bind Android /dev/null");
+		return -1;
+	}
+
+	/* Android devices commonly lack /dev/shm.  Provide private writable
+	 * scratch directories for both tmpfs-backed Android paths; the statfs()
+	 * and fstatfs() handlers report their filesystem type as tmpfs.  The
+	 * temporary directories are removed when PRoot exits. */
+	dev_shm = create_temp_directory(tracee->fs, "proot-dev-shm");
+	properties = create_temp_directory(tracee->fs, "proot-properties");
+	if (dev_shm == NULL || properties == NULL) {
+		note(tracee, ERROR, USER, "can't initialize Android tmpfs compatibility paths");
+		return -1;
+	}
+	if (new_binding(tracee, dev_shm, "/dev/shm", true) == NULL ||
+	    new_binding(tracee, properties, "/dev/__properties__", true) == NULL) {
+		note(tracee, ERROR, USER, "can't bind Android tmpfs compatibility paths");
+		return -1;
+	}
 
 	/* Do not bind host /dev or /tmp here.  Android's ueventd and init must
 	 * see the rootfs-owned paths; exposing the host /dev causes ueventd to

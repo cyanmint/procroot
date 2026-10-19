@@ -49,6 +49,18 @@
 #include "extension/extension.h"
 #include "arch.h"
 
+static int write_tmpfs_magic(Tracee *tracee, word_t stat_addr)
+{
+	word_t magic = 0x01021994;
+	unsigned short endian_probe = 1;
+	size_t magic_size = sizeof_word(tracee);
+	size_t offset = (*(unsigned char *) &endian_probe == 1)
+		? 0 : sizeof(magic) - magic_size;
+
+	return write_data(tracee, stat_addr,
+		(const char *) &magic + offset, magic_size);
+}
+
 /**
  * Translate the output arguments of the current @tracee's syscall in
  * the @tracee->pid process area. This function sets the result of
@@ -745,16 +757,8 @@ void translate_syscall_exit(Tracee *tracee)
 		Comparison comparison = compare_paths(devshm_path, statfs_path);
 		if (comparison == PATHS_ARE_EQUAL || comparison == PATH1_IS_PREFIX) {
 			VERBOSE(tracee, 5, "Updating statfs() result to fake tmpfs /dev/shm");
-			/* Write TMPFS_MAGIC at beginning of statfs structure.
-			 *
-			 * (It's at beginning of structure regardless of syscall variant
-			 * (statfs vs statfs64) and architecture bitness
-			 * (on 64 bit this field is 8 bytes long, but as long as it's
-			 * little endian, it will need only first 4 bytes to be modified,
-			 * as next 4 bytes will always be 0))
-			 * */
 			word_t stat_addr = peek_reg(tracee, ORIGINAL, syscall_number == PR_statfs64 ? SYSARG_3 : SYSARG_2);
-			int write_status = write_data(tracee, stat_addr, "\x94\x19\x02\x01", 4);
+			int write_status = write_tmpfs_magic(tracee, stat_addr);
 			if (write_status < 0) {
 				VERBOSE(tracee, 5, "Updating statfs() result failed");
 			}
@@ -766,12 +770,50 @@ void translate_syscall_exit(Tracee *tracee)
 				VERBOSE(tracee, 5, "Updating statfs() result to fake tmpfs /dev/__properties__");
 				word_t stat_addr = peek_reg(tracee, ORIGINAL,
 				                            syscall_number == PR_statfs64 ? SYSARG_3 : SYSARG_2);
-				if (write_data(tracee, stat_addr, "\x94\x19\x02\x01", 4) < 0)
+				if (write_tmpfs_magic(tracee, stat_addr) < 0)
 					VERBOSE(tracee, 5, "Updating property statfs() result failed");
 			}
 		}
 		else {
 			VERBOSE(tracee, 5, "statfs() not for compatibility paths, not changing result");
+		}
+
+		goto end;
+	}
+
+	case PR_fstatfs:
+	case PR_fstatfs64: {
+		char devshm_path[PATH_MAX];
+		char properties_path[PATH_MAX];
+		char statfs_path[PATH_MAX];
+		int fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
+		word_t stat_addr;
+		Comparison comparison;
+
+		if (syscall_result != 0 ||
+		    readlink_proc_pid_fd(tracee->pid, fd, statfs_path) < 0)
+			goto end;
+
+		stat_addr = peek_reg(tracee, ORIGINAL,
+		                     syscall_number == PR_fstatfs64 ? SYSARG_3 : SYSARG_2);
+		if (translate_path(tracee, devshm_path, AT_FDCWD, "/dev/shm", true) >= 0) {
+			comparison = compare_paths(devshm_path, statfs_path);
+			if (comparison == PATHS_ARE_EQUAL || comparison == PATH1_IS_PREFIX) {
+				VERBOSE(tracee, 5, "Updating fstatfs() result to fake tmpfs /dev/shm");
+				if (write_tmpfs_magic(tracee, stat_addr) < 0)
+					VERBOSE(tracee, 5, "Updating /dev/shm fstatfs() result failed");
+				goto end;
+			}
+		}
+
+		if (translate_path(tracee, properties_path, AT_FDCWD,
+		                   "/dev/__properties__", true) >= 0) {
+			comparison = compare_paths(properties_path, statfs_path);
+			if (comparison == PATHS_ARE_EQUAL || comparison == PATH1_IS_PREFIX) {
+				VERBOSE(tracee, 5, "Updating fstatfs() result to fake tmpfs /dev/__properties__");
+				if (write_tmpfs_magic(tracee, stat_addr) < 0)
+					VERBOSE(tracee, 5, "Updating property fstatfs() result failed");
+			}
 		}
 
 		goto end;

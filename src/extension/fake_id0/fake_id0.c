@@ -35,6 +35,7 @@
 #include <stdlib.h>      /* strtol(3), */
 #include <linux/auxvec.h>/* AT_,  */
 #include <sys/socket.h>  /* cmsghdr, */
+#include <sys/xattr.h>   /* XATTR_CREATE, XATTR_REPLACE, */
 #include <linux/net.h>   /* SYS_SENDMSG, */
 
 #include "extension/extension.h"
@@ -48,6 +49,7 @@
 #include "tracee/mem.h"
 #include "execve/auxv.h"
 #include "path/binding.h"
+#include "path/path.h"
 #include "path/f2fs-bug.h"
 #include "arch.h"
 
@@ -576,11 +578,69 @@ static int adjust_elf_auxv(Tracee *tracee, Config *config)
 	return 0;
 }
 
+static bool is_guest_property_selinux_xattr(Tracee *tracee)
+{
+	Sysnum sysnum = get_sysnum(tracee, ORIGINAL);
+	char name[sizeof("security.selinux")] = { 0 };
+	char guest_path[PATH_MAX] = { 0 };
+	char xattr_path[PATH_MAX];
+	char properties_path[PATH_MAX];
+	word_t flags;
+	Comparison comparison;
+	int status;
+
+	if (sysnum != PR_setxattr && sysnum != PR_lsetxattr && sysnum != PR_fsetxattr)
+		return false;
+
+	flags = peek_reg(tracee, ORIGINAL, SYSARG_5);
+	if (flags != 0 && flags != XATTR_CREATE && flags != XATTR_REPLACE)
+		return false;
+
+	status = read_string(tracee, name,
+		peek_reg(tracee, ORIGINAL, SYSARG_2), sizeof(name));
+	if (status != (int) sizeof(name)
+	    || name[sizeof(name) - 1] != '\0'
+	    || strcmp(name, "security.selinux") != 0)
+		return false;
+
+	if (sysnum == PR_fsetxattr) {
+		status = readlink_proc_pid_fd(tracee->pid,
+			(int) peek_reg(tracee, ORIGINAL, SYSARG_1), xattr_path);
+	}
+	else {
+		status = read_string(tracee, guest_path,
+			peek_reg(tracee, ORIGINAL, SYSARG_1), sizeof(guest_path));
+		if (status <= 0 || status >= PATH_MAX)
+			return false;
+		status = translate_path(tracee, xattr_path, AT_FDCWD, guest_path,
+			sysnum != PR_lsetxattr);
+	}
+	if (status < 0 || translate_path(tracee, properties_path, AT_FDCWD,
+					 "/dev/__properties__", true) < 0)
+		return false;
+
+	comparison = compare_paths(properties_path, xattr_path);
+	return comparison == PATHS_ARE_EQUAL || comparison == PATH1_IS_PREFIX;
+}
+
 static int handle_perm_err_exit_end(Tracee *tracee, Config *config, bool even_if_not_root) {
 	word_t result;
 
 	/* Override only permission errors.  */
 	result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+
+	/* A guest's SELinux property labels may not exist in the host policy.
+	 * Linux reports EINVAL (or EOPNOTSUPP) for those security.selinux
+	 * xattrs; Android init treats any such failure as fatal even when
+	 * SELinux is disabled in the guest.  Do not apply guest labels to the
+	 * host filesystem, but report these unsupported metadata writes as
+	 * successful under fake-root semantics. */
+	if (even_if_not_root
+	    && ((int) result == -EINVAL || (int) result == -EOPNOTSUPP)
+	    && is_guest_property_selinux_xattr(tracee)) {
+		poke_reg(tracee, SYSARG_RESULT, 0);
+		return 0;
+	}
 
 #ifdef USERLAND
 	/** If the call has been set to PR_void, it "succeeded" in
