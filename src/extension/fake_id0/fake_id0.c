@@ -30,12 +30,16 @@
 #include <unistd.h>      /* get*id(2),  */
 #include <sys/ptrace.h>  /* linux.git:c0a3a20b  */
 #include <sys/prctl.h>   /* PR_SET_KEEPCAPS, PR_GET_KEEPCAPS, */
+#include <linux/prctl.h> /* PR_CAP_AMBIENT, */
+#include <linux/securebits.h> /* SECBIT_*, SECURE_ALL_*, */
+#include <linux/capability.h> /* CAP_SETUID, CAP_SETGID, CAP_SETPCAP, */
 #include <linux/audit.h> /* AUDIT_ARCH_*,  */
 #include <string.h>      /* memcpy(3), */
 #include <stdlib.h>      /* strtol(3), */
 #include <linux/auxvec.h>/* AT_,  */
 #include <sys/socket.h>  /* cmsghdr, */
 #include <sys/xattr.h>   /* XATTR_CREATE, XATTR_REPLACE, */
+#include <sys/resource.h> /* RLIMIT_MEMLOCK, prlimit64, */
 #include <linux/net.h>   /* SYS_SENDMSG, */
 
 #include "extension/extension.h"
@@ -108,19 +112,37 @@ static bool is_16bit_id_syscall(const Tracee *tracee, Sysnum sysnum)
 } while (0)
 
 /**
- * Clear the fake CAP_SETUID/CAP_SETGID flag (caps_active) when a setuid-
- * family syscall has just performed a "permanent" privilege drop: at
- * least one of r/e/s uid was 0 before the call and none is 0 after.
- * This mirrors the Linux rule that clears capabilities on such a
- * transition, unless prctl(PR_SET_KEEPCAPS, 1) was used.  Operates on
- * the current Config in scope.
+ * Update the virtual capability state after a permanent UID drop: at least
+ * one of r/e/s uid was 0 before the call and none is 0 after. KEEP_CAPS
+ * preserves the fake SETUID/SETGID capability; effective SETPCAP is cleared
+ * unless NO_SETUID_FIXUP is set. Operates on the current Config in scope.
  */
 #define MAYBE_DROP_CAPS(prev_root) do {					\
-	if ((prev_root) && !config->keep_caps				\
-	    && config->ruid != 0 && config->euid != 0			\
-	    && config->suid != 0)					\
-		config->caps_active = false;				\
+	if ((prev_root) && config->ruid != 0 && config->euid != 0	\
+	    && config->suid != 0) {					\
+		if (!config->keep_caps					\
+		    && !(config->securebits & SECBIT_NO_SETUID_FIXUP))	\
+			config->caps_active = false;				\
+		if (!(config->securebits & SECBIT_NO_SETUID_FIXUP))	\
+			config->cap_setpcap = false;				\
+	}								\
 } while (0)
+
+static uint64_t get_cap_bounding_set(void)
+{
+	uint64_t cap_bset = 0;
+	unsigned int capability;
+
+	for (capability = 0; capability < 64; capability++) {
+		int is_set = prctl(PR_CAPBSET_READ, capability, 0, 0, 0);
+		if (is_set < 0)
+			break;
+		if (is_set != 0)
+			cap_bset |= (uint64_t) 1 << capability;
+	}
+
+	return cap_bset;
+}
 
 /**
  * Emulate setuid(2) and setgid(2).
@@ -382,6 +404,7 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_oldlstat,		FILTER_SYSEXIT },
 	{ PR_oldstat,		FILTER_SYSEXIT },
 	{ PR_prctl,		FILTER_SYSEXIT },
+	{ PR_prlimit64,	FILTER_SYSEXIT },
 	{ PR_sendmsg,		0 },
 	{ PR_setfsgid,		FILTER_SYSEXIT },
 	{ PR_setfsgid32,	FILTER_SYSEXIT },
@@ -399,6 +422,7 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_setresgid32,	FILTER_SYSEXIT },
 	{ PR_setresuid,		FILTER_SYSEXIT },
 	{ PR_setresuid32,	FILTER_SYSEXIT },
+	{ PR_setrlimit,	FILTER_SYSEXIT },
 	{ PR_setuid,		FILTER_SYSEXIT },
 	{ PR_setuid32,		FILTER_SYSEXIT },
 	{ PR_setxattr,		FILTER_SYSEXIT },
@@ -660,6 +684,193 @@ static int handle_perm_err_exit_end(Tracee *tracee, Config *config, bool even_if
 	if (even_if_not_root || config->euid == 0) /* TODO: || HAS_CAP(...) */
 		poke_reg(tracee, SYSARG_RESULT, 0);
 
+	return 0;
+}
+
+enum CapsetField {
+	CAPSET_EFFECTIVE,
+	CAPSET_PERMITTED,
+	CAPSET_INHERITABLE,
+};
+
+static uint64_t capset_field_mask(const struct __user_cap_data_struct *data,
+				 unsigned int data_count, enum CapsetField field)
+{
+	uint64_t mask = 0;
+	unsigned int word;
+
+	for (word = 0; word < data_count; word++) {
+		uint32_t value;
+		switch (field) {
+		case CAPSET_EFFECTIVE:
+			value = data[word].effective;
+			break;
+		case CAPSET_PERMITTED:
+			value = data[word].permitted;
+			break;
+		case CAPSET_INHERITABLE:
+			value = data[word].inheritable;
+			break;
+		default:
+			assert(false);
+		}
+		mask |= (uint64_t) value << (word * 32);
+	}
+
+	return mask;
+}
+
+static bool capset_has_effective(const struct __user_cap_data_struct *data,
+				 unsigned int data_count, unsigned int capability)
+{
+	return (capset_field_mask(data, data_count, CAPSET_EFFECTIVE) &
+		((uint64_t) 1 << capability)) != 0;
+}
+
+static bool capset_is_allowed(const Config *config, uint64_t effective,
+			      uint64_t permitted, uint64_t inheritable)
+{
+	if ((effective & ~permitted) != 0)
+		return false;
+	if ((permitted & ~config->cap_prm) == 0 &&
+	    (inheritable & ~config->cap_inh) == 0)
+		return true;
+	return config->cap_setpcap &&
+	       (permitted & ~(config->cap_prm | config->cap_inh)) == 0 &&
+	       (inheritable & ~(config->cap_inh | config->cap_bset)) == 0;
+}
+
+static int handle_capset_exit_end(Tracee *tracee, Config *config)
+{
+	struct __user_cap_header_struct header;
+	struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3] = {{0}};
+	word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	word_t header_address = peek_reg(tracee, ORIGINAL, SYSARG_1);
+	word_t data_address = peek_reg(tracee, ORIGINAL, SYSARG_2);
+	unsigned int data_count;
+	bool fake_capable = config->euid == 0 || config->keep_caps;
+
+	if (read_data(tracee, &header, header_address, sizeof(header)) < 0 ||
+	    header.pid != 0)
+		return 0;
+
+	if (header.version == _LINUX_CAPABILITY_VERSION_1)
+		data_count = 1;
+	else if (header.version == _LINUX_CAPABILITY_VERSION_2 ||
+		 header.version == _LINUX_CAPABILITY_VERSION_3)
+		data_count = _LINUX_CAPABILITY_U32S_3;
+	else
+		return 0;
+
+	if (read_data(tracee, data, data_address,
+		      sizeof(data[0]) * data_count) < 0)
+		return 0;
+
+	if ((int) result == -EPERM) {
+		uint64_t effective = capset_field_mask(data, data_count,
+						       CAPSET_EFFECTIVE);
+		uint64_t permitted = capset_field_mask(data, data_count,
+						       CAPSET_PERMITTED);
+		uint64_t inheritable = capset_field_mask(data, data_count,
+							 CAPSET_INHERITABLE);
+		if (fake_capable ||
+		    (config->cap_virtualized &&
+		     capset_is_allowed(config, effective, permitted, inheritable))) {
+			poke_reg(tracee, SYSARG_RESULT, 0);
+			result = 0;
+			if (fake_capable)
+				config->cap_virtualized = true;
+		}
+	}
+	if (result != 0)
+		return 0;
+
+	config->caps_active =
+		capset_has_effective(data, data_count, CAP_SETUID) ||
+		capset_has_effective(data, data_count, CAP_SETGID);
+	config->cap_setpcap =
+		capset_has_effective(data, data_count, CAP_SETPCAP);
+	config->cap_prm = capset_field_mask(data, data_count, CAPSET_PERMITTED);
+	config->cap_inh = capset_field_mask(data, data_count, CAPSET_INHERITABLE);
+	config->cap_ambient &= config->cap_prm & config->cap_inh;
+	return 0;
+}
+
+/* A rootless host cannot raise RLIMIT_MEMLOCK beyond its inherited hard
+ * limit. Apply the largest safe limit available to the tracee instead of
+ * reporting EPERM to fake-root init. This does not grant host capabilities. */
+static int handle_rlimit_exit_end(Tracee *tracee, Config *config)
+{
+	struct rlimit64 requested = { 0 };
+	struct rlimit64 current;
+	struct rlimit64 limited;
+	Sysnum sysnum = get_sysnum(tracee, ORIGINAL);
+	word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	word_t resource;
+	word_t address;
+	word_t old_address = 0;
+	bool is_prlimit = sysnum == PR_prlimit64;
+
+	if ((config->euid != 0 && !config->caps_active) ||
+	    (int) result != -EPERM)
+		return 0;
+
+	if (is_prlimit) {
+		word_t target = peek_reg(tracee, ORIGINAL, SYSARG_1);
+
+		if (target != 0 && target != (word_t) tracee->vpid)
+			return 0;
+		resource = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		address = peek_reg(tracee, ORIGINAL, SYSARG_3);
+		old_address = peek_reg(tracee, ORIGINAL, SYSARG_4);
+	}
+	else {
+		resource = peek_reg(tracee, ORIGINAL, SYSARG_1);
+		address = peek_reg(tracee, ORIGINAL, SYSARG_2);
+	}
+	if (resource != RLIMIT_MEMLOCK || address == 0)
+		return 0;
+
+	if (is_prlimit) {
+		if (read_data(tracee, &requested, address, sizeof(requested)) < 0)
+			return 0;
+	}
+	else if (sizeof_word(tracee) == sizeof(uint32_t)) {
+		uint32_t values[2];
+
+		if (read_data(tracee, values, address, sizeof(values)) < 0)
+			return 0;
+		requested.rlim_cur = values[0] == UINT32_MAX
+			? RLIM_INFINITY : values[0];
+		requested.rlim_max = values[1] == UINT32_MAX
+			? RLIM_INFINITY : values[1];
+	}
+	else {
+		uint64_t values[2];
+
+		if (read_data(tracee, values, address, sizeof(values)) < 0)
+			return 0;
+		requested.rlim_cur = values[0];
+		requested.rlim_max = values[1];
+	}
+	if (requested.rlim_cur > requested.rlim_max ||
+	    prlimit64(tracee->pid, RLIMIT_MEMLOCK, NULL, &current) < 0 ||
+	    requested.rlim_max <= current.rlim_max)
+		return 0;
+
+	limited.rlim_cur = requested.rlim_cur < current.rlim_max
+		? requested.rlim_cur : current.rlim_max;
+	limited.rlim_max = current.rlim_max;
+	if (prlimit64(tracee->pid, RLIMIT_MEMLOCK, &limited, NULL) < 0)
+		return 0;
+
+	if (old_address != 0 &&
+	    write_data(tracee, old_address, &current, sizeof(current)) < 0) {
+		(void) prlimit64(tracee->pid, RLIMIT_MEMLOCK, &current, NULL);
+		return 0;
+	}
+
+	poke_reg(tracee, SYSARG_RESULT, 0);
 	return 0;
 }
 
@@ -1110,16 +1321,132 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 		SETFSXID(g);
 
 	case PR_prctl: {
-		/* Mirror the tracee's PR_SET_KEEPCAPS state.  The real prctl
-		 * runs on the kernel; we only observe successful calls so the
-		 * fake_id0 cap model stays in sync with what the kernel does
-		 * for the tracee (PR_GET_KEEPCAPS is satisfied by the kernel
-		 * directly and needs no intercept). */
+		/* Keep the tracee's securebits independent from the host process.
+		 * A fake-root tracee cannot change the host kernel's securebits
+		 * without CAP_SETPCAP, so emulate that operation and its state. */
 		int op = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
-		int result = (int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
-		if (result == 0 && op == PR_SET_KEEPCAPS) {
-			word_t arg = peek_reg(tracee, ORIGINAL, SYSARG_2);
-			config->keep_caps = (arg != 0);
+		word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+		word_t arg = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		bool fake_root = (config->euid == 0 || config->caps_active);
+
+		switch (op) {
+		case PR_GET_SECUREBITS:
+			poke_reg(tracee, SYSARG_RESULT, config->securebits);
+			return 0;
+
+		case PR_SET_SECUREBITS: {
+			unsigned long old_bits = config->securebits;
+			unsigned long new_bits = arg;
+			bool invalid = (new_bits &
+				~(SECURE_ALL_BITS | SECURE_ALL_LOCKS)) != 0;
+			bool locked = (((old_bits & SECURE_ALL_LOCKS) >> 1) &
+				       (old_bits ^ new_bits)) != 0 ||
+				      (old_bits & SECURE_ALL_LOCKS & ~new_bits) != 0;
+
+			if (locked && (fake_root || result == 0)) {
+				poke_reg(tracee, SYSARG_RESULT, -EPERM);
+				return 0;
+			}
+			if (invalid && result == (word_t) -EPERM && fake_root)
+				return 0;
+
+			if (result == 0 ||
+			    (result == (word_t) -EPERM && fake_root)) {
+				config->securebits = new_bits;
+				config->keep_caps = (new_bits & SECBIT_KEEP_CAPS) != 0;
+				if (result != 0)
+					poke_reg(tracee, SYSARG_RESULT, 0);
+			}
+			return 0;
+		}
+
+		case PR_GET_KEEPCAPS:
+			poke_reg(tracee, SYSARG_RESULT,
+				(config->securebits & SECBIT_KEEP_CAPS) != 0);
+			return 0;
+
+		case PR_SET_KEEPCAPS:
+			if (arg > 1) {
+				if (fake_root)
+					poke_reg(tracee, SYSARG_RESULT, -EINVAL);
+				return 0;
+			}
+			if ((config->securebits & SECBIT_KEEP_CAPS_LOCKED) != 0) {
+				if (fake_root || result == 0)
+					poke_reg(tracee, SYSARG_RESULT, -EPERM);
+				return 0;
+			}
+			if (result == 0 ||
+			    (result == (word_t) -EPERM && fake_root)) {
+				if (arg != 0)
+					config->securebits |= SECBIT_KEEP_CAPS;
+				else
+					config->securebits &= ~SECBIT_KEEP_CAPS;
+				config->keep_caps = (arg != 0);
+				if (result != 0)
+					poke_reg(tracee, SYSARG_RESULT, 0);
+			}
+			return 0;
+
+		case PR_CAP_AMBIENT:
+			if (!config->cap_virtualized)
+				return 0;
+			{
+				word_t capability = peek_reg(tracee, ORIGINAL, SYSARG_3);
+				uint64_t mask;
+
+				if (arg == PR_CAP_AMBIENT_CLEAR_ALL) {
+					config->cap_ambient = 0;
+					poke_reg(tracee, SYSARG_RESULT, 0);
+					return 0;
+				}
+				if (capability >= 64) {
+					poke_reg(tracee, SYSARG_RESULT, -EINVAL);
+					return 0;
+				}
+				mask = (uint64_t) 1 << capability;
+
+				switch (arg) {
+				case PR_CAP_AMBIENT_IS_SET:
+					poke_reg(tracee, SYSARG_RESULT,
+						(config->cap_ambient & mask) != 0);
+					break;
+				case PR_CAP_AMBIENT_RAISE:
+					if ((config->cap_prm & mask) == 0 ||
+					    (config->cap_inh & mask) == 0)
+						poke_reg(tracee, SYSARG_RESULT, -EPERM);
+					else {
+						config->cap_ambient |= mask;
+						poke_reg(tracee, SYSARG_RESULT, 0);
+					}
+					break;
+				case PR_CAP_AMBIENT_LOWER:
+					config->cap_ambient &= ~mask;
+					poke_reg(tracee, SYSARG_RESULT, 0);
+					break;
+				default:
+					poke_reg(tracee, SYSARG_RESULT, -EINVAL);
+					break;
+				}
+				return 0;
+			}
+
+		case PR_CAPBSET_READ:
+			if ((int) result >= 0 && arg < 64)
+				poke_reg(tracee, SYSARG_RESULT,
+					(config->cap_bset >> arg) & 1);
+			return 0;
+
+		case PR_CAPBSET_DROP:
+			if (result == 0 ||
+			    ((int) result == -EPERM &&
+			     (config->euid == 0 || config->cap_setpcap))) {
+				if (arg < 64)
+					config->cap_bset &= ~((uint64_t) 1 << arg);
+				if (result != 0)
+					poke_reg(tracee, SYSARG_RESULT, 0);
+			}
+			return 0;
 		}
 		return 0;
 	}
@@ -1175,7 +1502,6 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 #endif
 	case PR_mknod:
 	case PR_mknodat:
-	case PR_capset:
 #ifndef USERLAND
 	case PR_chmod:
 #endif
@@ -1194,6 +1520,13 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 #endif
 	case PR_fchownat: 
 		return handle_perm_err_exit_end(tracee, config, false);
+
+	case PR_capset:
+		return handle_capset_exit_end(tracee, config);
+
+	case PR_setrlimit:
+	case PR_prlimit64:
+		return handle_rlimit_exit_end(tracee, config);
 
 #ifdef USERLAND
 	case PR_chmod:
@@ -1355,8 +1688,10 @@ static int handle_sysexit_start(Tracee *tracee, Config *config) {
 	if (!tracee->skip_proot_loader)
 		adjust_elf_auxv(tracee, config);
 
-	/* Linux clears PR_SET_KEEPCAPS on execve. */
+	/* Linux clears SECBIT_KEEP_CAPS on execve. */
 	config->keep_caps = false;
+	config->securebits &= ~SECBIT_KEEP_CAPS;
+	config->cap_setpcap = false;
 
 	status = stat(tracee->host_exe, &mode);
 	if (status < 0)
@@ -1367,6 +1702,7 @@ static int handle_sysexit_start(Tracee *tracee, Config *config) {
 		config->suid = 0;
 		/* Setuid-root binary gives the process fake CAP_SETUID. */
 		config->caps_active = true;
+		config->cap_setpcap = true;
 	}
 
 	if ((mode.st_mode & S_ISGID) != 0) {
@@ -1389,6 +1725,7 @@ int fake_id0_callback(Extension *extension, ExtensionEvent event, intptr_t data1
 		const char *gid_string;
 		Config *config;
 		int uid, gid;
+		int securebits;
 
 		errno = 0;
 		uid = strtol(uid_string, NULL, 10);
@@ -1421,7 +1758,16 @@ int fake_id0_callback(Extension *extension, ExtensionEvent event, intptr_t data1
 		config->sgid  = gid;
 		config->fsgid = gid;
 		config->caps_active = (uid == 0);
-		config->keep_caps = false;
+		config->cap_virtualized = false;
+		config->cap_setpcap = (uid == 0);
+		config->cap_inh = 0;
+		config->cap_prm = 0;
+		config->cap_ambient = 0;
+		config->cap_bset = get_cap_bounding_set();
+		securebits = prctl(PR_GET_SECUREBITS, 0, 0, 0, 0);
+		config->securebits = securebits < 0
+			? SECUREBITS_DEFAULT : (unsigned long) securebits;
+		config->keep_caps = (config->securebits & SECBIT_KEEP_CAPS) != 0;
 			/* Set the umask to the typical linux value. */
 			config->umask = 022;
 #ifdef USERLAND

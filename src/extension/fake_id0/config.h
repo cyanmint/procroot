@@ -2,6 +2,7 @@
 #define FAKE_ID0_CONFIG_H
 
 #include <stdbool.h>     /* bool */
+#include <stdint.h>      /* uint64_t */
 #include <sys/types.h>   /* uid_t, gid_t */
 
 typedef struct {
@@ -29,8 +30,22 @@ typedef struct {
 	/* Mirror of the tracee's prctl(PR_SET_KEEPCAPS) flag.  When set,
 	 * caps_active survives a UID drop, matching how PR_SET_KEEPCAPS plus
 	 * a follow-up capset() lets a process retain CAP_SETUID/CAP_SETGID
-	 * across setresuid().  Cleared by execve, per Linux semantics. */
+	 * across setresuid().  Mirrors SECBIT_KEEP_CAPS and is cleared by
+	 * execve, per Linux semantics. */
 	bool keep_caps;
+
+	/* Virtual securebits state, inherited by forked tracees and updated
+	 * by PR_SET_SECUREBITS/PR_SET_KEEPCAPS. */
+	unsigned long securebits;
+
+	/* Minimal capability state needed to emulate capability setup without
+	 * granting capabilities to the host process. */
+	bool cap_virtualized;
+	bool cap_setpcap;
+	uint64_t cap_inh;
+	uint64_t cap_prm;
+	uint64_t cap_ambient;
+	uint64_t cap_bset;
 
 #ifdef USERLAND
 	/* Host path of the file whose meta file is to get pending_mode

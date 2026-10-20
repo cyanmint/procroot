@@ -30,6 +30,24 @@ check-%.c: $(ROOTFS)/bin/% setup
 check-test-bdc90417.c: test-bdc90417
 	$(call check_c,$<,$(PROOT) -w . ./$<)
 
+check-test-securebits.c: $(ROOTFS)/bin/test-securebits setup
+	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$*)
+
+check-test-capset-drop.c: $(ROOTFS)/bin/test-capset-drop setup
+	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$*)
+
+check-test-ambient-caps.c: $(ROOTFS)/bin/test-ambient-caps setup
+	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$*)
+
+check-test-rlimit-memlock.c: $(ROOTFS)/bin/test-rlimit-memlock setup
+	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$*)
+
+check-test-binder-context-manager.c: test-binder-context-manager
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-epoll.c: test-binder-epoll
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
 # Not supported anymore.
 # check-test-af062114.c: test-af062114
 # 	$(call check_c,$<,$(PROOT) -v -1 -q /bin/true -b . -b /lib -b /lib64 -b /proc -r $(ROOTFS) ./$< | grep -- --inhibit-rpath)

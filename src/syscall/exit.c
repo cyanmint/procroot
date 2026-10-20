@@ -27,6 +27,7 @@
 #include <linux/ioctl.h> /* _IOW, */
 #include <linux/prctl.h> /* PR_GET_AUXV, */
 #include <string.h>      /* strlen(3), */
+#include <sys/stat.h>    /* struct stat, stat(2), */
 #include <unistd.h>      /* readlink(2), */
 
 #include "cli/note.h"
@@ -48,6 +49,71 @@
 #include "ptrace/wait.h"
 #include "extension/extension.h"
 #include "arch.h"
+
+/* Return the guest executable path when a proc fd points to the
+ * executable currently mapped by that tracee.  Bionic realpath() opens
+ * /proc/self/exe and reads /proc/self/fd/<fd>; the latter otherwise
+ * exposes PRoot's temporary loader file. */
+static const char *tracee_exe_from_proc_fd(Tracee *tracee,
+		const struct readlink_proc_fd_state *proc_fd)
+{
+	Tracee *fd_tracee;
+	char proc_exe[64];
+	char exe_target[PATH_MAX];
+	ssize_t size;
+	int status;
+
+	if (proc_fd->pid <= 0 || proc_fd->fd < 0)
+		return NULL;
+
+	fd_tracee = get_tracee(tracee, proc_fd->pid, false);
+	if (fd_tracee == NULL || fd_tracee->exe == NULL)
+		return NULL;
+
+	status = snprintf(proc_exe, sizeof(proc_exe), "/proc/%d/exe", proc_fd->pid);
+	if (status < 0 || (size_t) status >= sizeof(proc_exe))
+		return NULL;
+
+	size = readlink(proc_exe, exe_target, sizeof(exe_target) - 1);
+	if (size < 0 || (size_t) size >= sizeof(exe_target))
+		return NULL;
+	exe_target[size] = '\0';
+
+	if (strcmp(proc_fd->host_path, exe_target) != 0)
+		return NULL;
+
+	return fd_tracee->exe;
+}
+
+/* Report the guest executable's metadata for its proc executable fd. */
+static void translate_executable_fstat(Tracee *tracee, word_t stat_addr)
+{
+	struct stat tracee_stat;
+	struct stat proc_exe_stat;
+	struct stat guest_exe_stat;
+	char proc_exe[64];
+	int status;
+
+	if (stat_addr == 0 || tracee->host_exe == NULL || tracee->exe == NULL
+	    || tracee->qemu != NULL || tracee->skip_proot_loader
+	    || is_32on64_mode(tracee))
+		return;
+
+	if (read_data(tracee, &tracee_stat, stat_addr, sizeof(tracee_stat)) < 0)
+		return;
+
+	status = snprintf(proc_exe, sizeof(proc_exe), "/proc/%d/exe", tracee->pid);
+	if (status < 0 || (size_t) status >= sizeof(proc_exe))
+		return;
+
+	if (stat(proc_exe, &proc_exe_stat) < 0
+	    || tracee_stat.st_dev != proc_exe_stat.st_dev
+	    || tracee_stat.st_ino != proc_exe_stat.st_ino
+	    || stat(tracee->host_exe, &guest_exe_stat) < 0)
+		return;
+
+	(void) write_data(tracee, stat_addr, &guest_exe_stat, sizeof(guest_exe_stat));
+}
 
 static int write_tmpfs_magic(Tracee *tracee, word_t stat_addr)
 {
@@ -100,6 +166,16 @@ void translate_syscall_exit(Tracee *tracee)
 	syscall_number = get_sysnum(tracee, ORIGINAL);
 	syscall_result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
 	switch (syscall_number) {
+	case PR_fstat:
+	case PR_fstat64:
+		if ((int) syscall_result != 0
+		    || get_sysnum(tracee, CURRENT) != syscall_number)
+			goto end;
+
+		translate_executable_fstat(tracee,
+			peek_reg(tracee, ORIGINAL, SYSARG_2));
+		goto end;
+
 	case PR_brk:
 		translate_brk_exit(tracee);
 		goto end;
@@ -387,6 +463,7 @@ void translate_syscall_exit(Tracee *tracee)
 		size_t max_size;
 		word_t input;
 		word_t output;
+		const char *proc_exe = NULL;
 		struct readlink_proc_fd_state proc_fd = {
 			.pid = 0, .fd = -1, .host_path = referee, .substituted = false,
 		};
@@ -456,8 +533,13 @@ void translate_syscall_exit(Tracee *tracee)
 			int fd_number;
 			char extra;
 
-			if (sscanf(referer, "/proc/%d/fd/%d%c", &fd_pid, &fd_number, &extra) == 2
+			if (sscanf(referer, "/proc/self/fd/%d%c", &fd_number, &extra) == 1
 			    && fd_number >= 0) {
+				proc_fd.pid = tracee->pid;
+				proc_fd.fd  = fd_number;
+			}
+			else if (sscanf(referer, "/proc/%d/fd/%d%c", &fd_pid, &fd_number, &extra) == 2
+				 && fd_number >= 0) {
 				proc_fd.pid = (pid_t) fd_pid;
 				proc_fd.fd  = fd_number;
 			}
@@ -491,11 +573,18 @@ void translate_syscall_exit(Tracee *tracee)
 			status = notify_extensions(tracee, READLINK_PROC_FD, (intptr_t) &proc_fd, 0);
 			if (status < 0)
 				break;
+			if (!proc_fd.substituted)
+				proc_exe = tracee_exe_from_proc_fd(tracee, &proc_fd);
 		}
 
 		status = detranslate_path(tracee, referee, referer);
 		if (status < 0)
 			break;
+		if (proc_exe != NULL) {
+			strcpy(referee, proc_exe);
+			proc_fd.substituted = true;
+			status = 0;
+		}
 
 		/* The original path doesn't require any transformation, i.e
 		 * it is a symetric binding.  */

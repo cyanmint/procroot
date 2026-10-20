@@ -13,7 +13,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 #include <sys/ioctl.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <sys/reboot.h>
@@ -167,7 +170,8 @@ static bool binderfs_allocated[BINDER_DOMAIN_COUNT];
 
 static FilteredSysnum filtered_sysnums[] = {
 	{ PR_open, FILTER_SYSEXIT }, { PR_openat, FILTER_SYSEXIT },
-	{ PR_openat2, FILTER_SYSEXIT }, { PR_ioctl, FILTER_SYSEXIT },
+	{ PR_openat2, FILTER_SYSEXIT }, { PR_eventfd2, FILTER_SYSEXIT },
+	{ PR_ioctl, FILTER_SYSEXIT },
 	{ PR_x32_ioctl, FILTER_SYSEXIT },
 	{ PR_mmap, FILTER_SYSEXIT }, { PR_mmap2, FILTER_SYSEXIT },
 	{ PR_mknod, FILTER_SYSEXIT }, { PR_mknodat, FILTER_SYSEXIT },
@@ -206,6 +210,39 @@ static void remember_fd(BinderConfig *c, int fd, enum BinderDomain domain)
 		c->fds[i].active = true; c->fds[i].fd = fd; c->fds[i].domain = domain; return;
 	}
 }
+static bool replace_binder_open_with_eventfd(Tracee *tracee, Sysnum syscall)
+{
+	uint64_t open_flags;
+	unsigned int event_flags = 0;
+
+	switch (syscall) {
+	case PR_open:
+		open_flags = peek_reg(tracee, CURRENT, SYSARG_2);
+		break;
+	case PR_openat:
+		open_flags = peek_reg(tracee, CURRENT, SYSARG_3);
+		break;
+	case PR_openat2: {
+		word_t how = peek_reg(tracee, CURRENT, SYSARG_3);
+		word_t size = peek_reg(tracee, CURRENT, SYSARG_4);
+
+		if (size < sizeof(open_flags) ||
+		    read_data(tracee, &open_flags, how, sizeof(open_flags)) < 0)
+			return false;
+		break;
+	}
+	default:
+		return false;
+	}
+	if ((open_flags & O_CLOEXEC) != 0)
+		event_flags |= EFD_CLOEXEC;
+	if ((open_flags & O_NONBLOCK) != 0)
+		event_flags |= EFD_NONBLOCK;
+	set_sysnum(tracee, PR_eventfd2);
+	poke_reg(tracee, SYSARG_1, 0);
+	poke_reg(tracee, SYSARG_2, event_flags);
+	return true;
+}
 static void remember_uevent_socket(BinderConfig *c, int fd)
 {
 	int i;
@@ -236,15 +273,73 @@ static bool is_uevent_socket(BinderConfig *c, int fd)
 static BinderEndpoint *endpoint_for(Tracee *tracee)
 {
 	size_t i;
-	for (i = 0; i < binder_broker.count; i++)
+	size_t free_slot = MAX_BINDER_ENDPOINTS;
+
+	for (i = 0; i < binder_broker.count; i++) {
 		if (binder_broker.endpoints[i].tracee == tracee)
 			return &binder_broker.endpoints[i];
-	if (binder_broker.count == MAX_BINDER_ENDPOINTS)
-		return NULL;
-	memset(&binder_broker.endpoints[binder_broker.count], 0,
-	       sizeof(binder_broker.endpoints[0]));
-	binder_broker.endpoints[binder_broker.count].tracee = tracee;
-	return &binder_broker.endpoints[binder_broker.count++];
+		if (binder_broker.endpoints[i].tracee == NULL &&
+		    free_slot == MAX_BINDER_ENDPOINTS)
+			free_slot = i;
+	}
+	if (free_slot == MAX_BINDER_ENDPOINTS) {
+		if (binder_broker.count == MAX_BINDER_ENDPOINTS)
+			return NULL;
+		free_slot = binder_broker.count++;
+	}
+	memset(&binder_broker.endpoints[free_slot], 0,
+	       sizeof(binder_broker.endpoints[free_slot]));
+	binder_broker.endpoints[free_slot].tracee = tracee;
+	return &binder_broker.endpoints[free_slot];
+}
+
+static BinderEndpoint *find_endpoint(Tracee *tracee)
+{
+	size_t i;
+
+	for (i = 0; i < binder_broker.count; i++) {
+		if (binder_broker.endpoints[i].tracee == tracee)
+			return &binder_broker.endpoints[i];
+	}
+	return NULL;
+}
+
+static void release_endpoint(BinderEndpoint *endpoint)
+{
+	size_t i;
+	size_t j;
+
+	if (endpoint == NULL)
+		return;
+	for (i = 0; i < BINDER_DOMAIN_COUNT; i++) {
+		if (binder_broker.context_manager[i] == endpoint)
+			binder_broker.context_manager[i] = NULL;
+	}
+	for (i = 0; i < binder_broker.count; i++) {
+		BinderEndpoint *other = &binder_broker.endpoints[i];
+
+		if (other->tracee == NULL || other == endpoint)
+			continue;
+		if (other->last_sender == endpoint)
+			other->last_sender = NULL;
+		for (j = 0; j < sizeof(other->handles) / sizeof(other->handles[0]); j++) {
+			if (other->handles[j] == endpoint)
+				other->handles[j] = NULL;
+		}
+		j = 0;
+		while (j < other->queue_count) {
+			if (other->queue[j].sender != endpoint) {
+				j++;
+				continue;
+			}
+			if (j + 1 < other->queue_count)
+				memmove(&other->queue[j], &other->queue[j + 1],
+					(other->queue_count - j - 1) *
+					sizeof(other->queue[0]));
+			other->queue_count--;
+		}
+	}
+	memset(endpoint, 0, sizeof(*endpoint));
 }
 
 static BinderEndpoint *target_for(BinderEndpoint *sender,
@@ -625,6 +720,12 @@ int binder_callback(Extension *e, ExtensionEvent event, intptr_t data1, intptr_t
 		}
 		if (s == PR_close) forget_fd(c, (int)peek_reg(t, CURRENT, SYSARG_1));
 		return 0;
+	case SYSCALL_ENTER_END:
+		c = talloc_get_type_abort(e->config, BinderConfig);
+		s = get_sysnum(t, ORIGINAL);
+		if (c->last_binder_path)
+			(void)replace_binder_open_with_eventfd(t, s);
+		return 0;
 	case SYSCALL_EXIT_START:
 		c = talloc_get_type_abort(e->config, BinderConfig); s = get_sysnum(t, ORIGINAL);
 		if ((s == PR_ioctl || s == PR_x32_ioctl) && !c->ioctl_pending) {
@@ -723,6 +824,10 @@ int binder_callback(Extension *e, ExtensionEvent event, intptr_t data1, intptr_t
 			else r = -ENOTTY;
 			result(t, r); c->ioctl_pending = false;
 		}
+		return 0;
+	case NEW_STATUS:
+		if (WIFEXITED((int)data1) || WIFSIGNALED((int)data1))
+			release_endpoint(find_endpoint(t));
 		return 0;
 	default: return 0;
 	}

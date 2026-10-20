@@ -359,6 +359,8 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_fchmodat,		0 },
 	{ PR_fchmodat2,		0 },
 	{ PR_fchownat,		0 },
+	{ PR_fstat,		FILTER_SYSEXIT },
+	{ PR_fstat64,		FILTER_SYSEXIT },
 	{ PR_fsconfig,		0 },
 	{ PR_fsmount,		0 },
 	{ PR_fsopen,		0 },
