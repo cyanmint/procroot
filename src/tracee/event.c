@@ -31,6 +31,7 @@
 #include <string.h>     /* strcmp(3), */
 #include <strings.h>    /* bzero(3), */
 #include <errno.h>      /* errno(3), */
+#include <stdio.h>      /* FILE, fprintf(3), */
 #include <stdbool.h>    /* bool, true, false, */
 #include <assert.h>     /* assert(3), */
 #include <stdlib.h>     /* atexit(3), getenv(3), */
@@ -163,6 +164,18 @@ static void kill_all_tracees2(int signum, siginfo_t *siginfo UNUSED, void *ucont
 	note(NULL, WARNING, INTERNAL, "signal %d received from process %d",
 		signum, siginfo->si_pid);
 	kill_all_tracees();
+
+	/* Preserve the native crash report for temporary diagnostic builds. */
+	#ifdef PROOT_DEBUG_FATAL
+	if (signum == SIGSEGV) {
+		struct sigaction default_action = {};
+
+		default_action.sa_handler = SIG_DFL;
+		(void)sigemptyset(&default_action.sa_mask);
+		(void)sigaction(signum, &default_action, NULL);
+		return;
+	}
+	#endif
 
 	/* Exit immediately for system signals (segmentation fault,
 	 * illegal instruction, ...), otherwise exit cleanly through
@@ -510,6 +523,89 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 		/* Don't use WSTOPSIG() to extract the signal
 		 * since it clears the PTRACE_EVENT_* bits. */
 		signal = (tracee_status & 0xfff00) >> 8;
+		#ifdef PROOT_DEBUG_FATAL
+		if (signal == SIGSEGV) {
+			static unsigned int diagnostic_count;
+			siginfo_t siginfo = {};
+			int siginfo_status;
+			int siginfo_errno;
+			int regs_status;
+			int regs_errno;
+			int maps_path_status;
+			int maps_errno;
+			word_t instruction_pointer = 0;
+			word_t stack_pointer = 0;
+			unsigned long long map_start;
+			unsigned long long map_end;
+			unsigned long long map_file_offset;
+			char maps_path[64];
+			char map_line[1024];
+			FILE *maps_file;
+			bool map_found = false;
+
+			if (diagnostic_count < 32) {
+				siginfo_status = ptrace(PTRACE_GETSIGINFO, tracee->pid,
+					NULL, &siginfo);
+				siginfo_errno = errno;
+				regs_status = fetch_regs(tracee);
+				regs_errno = errno;
+				if (regs_status == 0) {
+					instruction_pointer = peek_reg(tracee, CURRENT,
+						INSTR_POINTER);
+					stack_pointer = peek_reg(tracee, CURRENT,
+						STACK_POINTER);
+				}
+				fprintf(stderr,
+					"[DEBUG-TRACE-SIGSEGV-r158] vpid=%" PRIu64
+					" pid=%d code=%d addr=%p siginfo_rc=%d siginfo_errno=%d"
+					" regs_rc=%d regs_errno=%d pc=%#llx sp=%#llx\n",
+					tracee->vpid, tracee->pid,
+					siginfo_status == 0 ? siginfo.si_code : 0,
+					siginfo_status == 0 ? siginfo.si_addr : NULL,
+					siginfo_status, siginfo_errno,
+					regs_status, regs_errno,
+					(unsigned long long)instruction_pointer,
+					(unsigned long long)stack_pointer);
+				maps_path_status = snprintf(maps_path, sizeof(maps_path),
+					"/proc/%d/maps", tracee->pid);
+				maps_file = maps_path_status > 0 &&
+					(size_t)maps_path_status < sizeof(maps_path)
+					? fopen(maps_path, "r") : NULL;
+				maps_errno = maps_file == NULL ? errno : 0;
+				if (maps_file != NULL) {
+					while (fgets(map_line, sizeof(map_line), maps_file) != NULL) {
+						if (sscanf(map_line, "%llx-%llx %*s %llx",
+							   &map_start, &map_end,
+							   &map_file_offset) != 3 ||
+						    instruction_pointer < map_start ||
+						    instruction_pointer >= map_end)
+							continue;
+
+						fprintf(stderr,
+							"[DEBUG-TRACE-SIGSEGV-MAP-r163] vpid=%" PRIu64
+							" pid=%d pc=%#llx file_offset=%#llx %s",
+							tracee->vpid, tracee->pid,
+							(unsigned long long)instruction_pointer,
+							map_file_offset +
+								(unsigned long long)instruction_pointer - map_start,
+							map_line);
+						map_found = true;
+						break;
+					}
+					fclose(maps_file);
+				}
+				if (!map_found)
+					fprintf(stderr,
+						"[DEBUG-TRACE-SIGSEGV-MAP-r163] vpid=%" PRIu64
+						" pid=%d pc=%#llx map=%s errno=%d\n",
+						tracee->vpid, tracee->pid,
+						(unsigned long long)instruction_pointer,
+						maps_file == NULL ? "unavailable" : "unmapped",
+						maps_errno);
+				diagnostic_count++;
+			}
+		}
+		#endif
 
 		switch (signal) {
 			static bool deliver_sigtrap = false;
@@ -606,6 +702,11 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 					 * result does (see new_child()).  */
 					if (!was_sysenter && tracee->pending_child)
 						resolve_pending_child(tracee);
+
+					/* Let clone handlers virtualize the child's PID/TID
+					 * before the child can run past its initial stop.  */
+					if (!was_sysenter)
+						restart_deferred_child(tracee);
 
 					/* In case we've changed on enter sysnum to PR_void,
 					 * the outer seccomp policy may check the syscall
@@ -799,12 +900,26 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 			break;
 
 		case SIGTRAP | PTRACE_EVENT_VFORK_DONE << 8:
-		case SIGTRAP | PTRACE_EVENT_EXEC  << 8:
 		case SIGTRAP | PTRACE_EVENT_EXIT  << 8:
 			signal = 0;
 			if (tracee->last_restart_how) {
 				tracee->restart_how = tracee->last_restart_how;
 			}
+			break;
+
+		case SIGTRAP | PTRACE_EVENT_EXEC << 8:
+			signal = 0;
+			{
+				FilesTableChange change;
+
+				change.old_id = tracee->files_table_id;
+				tracee_reset_files_table(tracee);
+				change.new_id = tracee->files_table_id;
+				(void)notify_extensions(tracee, FILES_TABLE_CHANGED,
+						(intptr_t)&change, 0);
+			}
+			if (tracee->last_restart_how)
+				tracee->restart_how = tracee->last_restart_how;
 			break;
 
 		case SIGSTOP:

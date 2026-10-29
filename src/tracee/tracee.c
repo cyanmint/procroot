@@ -50,6 +50,47 @@
 #include "compat.h"
 
 static Tracees tracees;
+static uint64_t next_files_table_id = 1;
+
+typedef struct deferred_child_restart {
+	Tracee *parent;
+	Tracee *child;
+	struct deferred_child_restart *next;
+} DeferredChildRestart;
+
+static DeferredChildRestart *deferred_child_restarts;
+
+static void defer_child_restart(Tracee *parent, Tracee *child)
+{
+	DeferredChildRestart *deferred;
+
+	deferred = talloc_zero(parent, DeferredChildRestart);
+	if (deferred == NULL) {
+		note(parent, WARNING, SYSTEM, "running out of memory");
+		(void) restart_tracee(child, 0);
+		return;
+	}
+
+	deferred->parent = parent;
+	deferred->child = child;
+	deferred->next = deferred_child_restarts;
+	deferred_child_restarts = deferred;
+}
+
+static uint64_t allocate_files_table_id(void)
+{
+	if (next_files_table_id == 0)
+		return 0;
+	return next_files_table_id++;
+}
+
+void tracee_reset_files_table(Tracee *tracee)
+{
+	if (tracee != NULL) {
+		tracee->files_table_id = allocate_files_table_id();
+		tracee->external_files_table_sharing = false;
+	}
+}
 
 
 /**
@@ -187,6 +228,7 @@ Tracee *new_dummy_tracee(TALLOC_CTX *context)
 	tracee = talloc_zero(context, Tracee);
 	if (tracee == NULL)
 		return NULL;
+	tracee_reset_files_table(tracee);
 
 	/* Allocate a memory collector.  */
 	tracee->ctx = talloc_new(tracee);
@@ -389,12 +431,15 @@ void free_terminated_tracees()
 		Tracee *tracee = next;
 		next = tracee->link.le_next;
 
-		if (tracee->terminated)
+		if (tracee->terminated) {
+			restart_deferred_child(tracee);
 			TALLOC_FREE(tracee);
+		}
 	}
 }
 
-static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid);
+static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid,
+		bool defer_restart);
 
 /**
  * Read the Tgid, PPid and TracerPid fields of /proc/@pid/status.  This
@@ -423,6 +468,41 @@ static int read_proc_status_ids(pid_t pid, pid_t *tgid, pid_t *ppid, pid_t *trac
 	fclose(file);
 
 	return (found == 7 ? 0 : -1);
+}
+
+int tracee_host_tgid(const Tracee *tracee, pid_t *tgid)
+{
+	pid_t ppid;
+	pid_t tracer;
+
+	if (tracee == NULL || tgid == NULL || tracee->pid <= 0)
+		return -EINVAL;
+	if (read_proc_status_ids(tracee->pid, tgid, &ppid, &tracer) < 0)
+		return -ESRCH;
+	return 0;
+}
+
+bool tracee_has_external_files_table_sharing(const Tracee *tracee)
+{
+	Tracee *candidate;
+	pid_t target_tgid;
+
+	if (tracee == NULL || tracee->files_table_id == 0 ||
+	    tracee->external_files_table_sharing ||
+	    tracee_host_tgid(tracee, &target_tgid) < 0)
+		return true;
+
+	LIST_FOREACH(candidate, &tracees, link) {
+		pid_t candidate_tgid;
+
+		if (candidate == tracee || candidate->terminated ||
+		    candidate->files_table_id != tracee->files_table_id)
+			continue;
+		if (tracee_host_tgid(candidate, &candidate_tgid) < 0 ||
+		    candidate_tgid != target_tgid)
+			return true;
+	}
+	return false;
 }
 
 /**
@@ -536,7 +616,8 @@ void adopt_held_children(void)
 				continue;
 
 			parent->pending_child = false;
-			(void) attach_child(parent, parent->pending_clone_flags, child->pid);
+			(void) attach_child(parent, parent->pending_clone_flags,
+					    child->pid, false);
 			break;
 		}
 	}
@@ -589,7 +670,8 @@ void resolve_pending_child(Tracee *parent)
 		return;
 	}
 
-	(void) attach_child(parent, parent->pending_clone_flags, pid);
+	(void) attach_child(parent, parent->pending_clone_flags, pid,
+			     (parent->pending_clone_flags & CLONE_VFORK) == 0);
 }
 
 /**
@@ -645,13 +727,15 @@ int new_child(Tracee *parent, word_t clone_flags)
 		return 0;
 	}
 
-	return attach_child(parent, clone_flags, (pid_t) pid);
+	return attach_child(parent, clone_flags, (pid_t) pid,
+			    (clone_flags & CLONE_VFORK) == 0);
 }
 
 /**
  * Register @pid as the new child of @parent, see new_child().
  */
-static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid)
+static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid,
+		bool defer_restart)
 {
 	int ptrace_options;
 	Tracee *child;
@@ -743,6 +827,14 @@ static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid)
 	 * specificity (ie. when a thread calls execve(2), its pid
 	 * gets replaced by the pid of its thread group leader).  */
 	child->clone = ((clone_flags & CLONE_THREAD) != 0);
+	if ((clone_flags & CLONE_FILES) != 0)
+		child->files_table_id = parent->files_table_id;
+	else
+		tracee_reset_files_table(child);
+	child->external_files_table_sharing =
+		(clone_flags & CLONE_FILES) != 0 &&
+		(parent->external_files_table_sharing ||
+		 (clone_flags & CLONE_THREAD) == 0);
 
 	/* Depending on how the new process is created, it may be
 	 * automatically traced by the parent's tracer.  */
@@ -874,6 +966,17 @@ static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid)
 	child->tool_name = parent->tool_name;
 
 	inherit_extensions(child, parent, clone_flags);
+	if ((clone_flags & CLONE_FILES) == 0) {
+		FilesTableChange change = {
+			.old_id = parent->files_table_id,
+			.new_id = child->files_table_id,
+		};
+
+		/* The child has a copy of the parent's open descriptors, but
+		 * extensions may track them by file-table identity.  */
+		(void)notify_extensions(child, FILES_TABLE_CHANGED,
+				(intptr_t)&change, 0);
+	}
 
 	/* Restart the child tracee if it was already alive but
 	 * stopped until that moment.  */
@@ -902,13 +1005,42 @@ static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid)
 			child->as_ptracee.event4.proot.value   = 0;
 		}
 
-		if (!keep_stopped)
-			(void) restart_tracee(child, 0);
+		if (!keep_stopped) {
+			if (defer_restart)
+				defer_child_restart(parent, child);
+			else
+				(void) restart_tracee(child, 0);
+		}
 	}
 
 	VERBOSE(child, 1, "vpid %" PRIu64 ": pid %d", child->vpid, child->pid);
 
 	return 0;
+}
+
+void restart_deferred_child(Tracee *parent)
+{
+	DeferredChildRestart **entry;
+
+	if (parent == NULL)
+		return;
+
+	entry = &deferred_child_restarts;
+	while (*entry != NULL) {
+		DeferredChildRestart *deferred = *entry;
+		Tracee *child;
+
+		if (deferred->parent != parent) {
+			entry = &deferred->next;
+			continue;
+		}
+
+		*entry = deferred->next;
+		child = deferred->child;
+		TALLOC_FREE(deferred);
+		if (!child->terminated)
+			(void) restart_tracee(child, 0);
+	}
 }
 
 /**

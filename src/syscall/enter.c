@@ -2541,6 +2541,9 @@ int translate_syscall_enter(Tracee *tracee)
 	 * network namespace it believes it was given.  */
 	case PR_clone: {
 		word_t flags = peek_reg(tracee, CURRENT, SYSARG_1);
+		if ((flags & CLONE_FILES) != 0 &&
+		    (flags & CLONE_THREAD) == 0)
+			tracee->external_files_table_sharing = true;
 		if ((flags & CLONE_NS_MASK) != 0) {
 			if ((flags & CLONE_NEWNS) != 0)
 				tracee->clone_stripped_newns = true;
@@ -2560,6 +2563,9 @@ int translate_syscall_enter(Tracee *tracee)
 		if (args_addr != 0) {
 			errno = 0;
 			flags = peek_word(tracee, args_addr);
+			if (errno == 0 && (flags & CLONE_FILES) != 0 &&
+			    (flags & CLONE_THREAD) == 0)
+				tracee->external_files_table_sharing = true;
 			if (errno == 0 && (flags & CLONE_NS_MASK) != 0) {
 				if ((flags & CLONE_NEWNS) != 0)
 					tracee->clone_stripped_newns = true;

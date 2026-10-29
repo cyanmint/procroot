@@ -38,33 +38,110 @@ static void append_runtime_binding_lines(Tracee *target_tracee, FILE *fp)
 	}
 }
 
+static void append_runtime_binding_mounts(Tracee *target_tracee, FILE *fp)
+{
+	Binding *binding;
+
+	if (target_tracee->fs->bindings.guest == NULL)
+		return;
+
+	for (binding = CIRCLEQ_FIRST(target_tracee->fs->bindings.guest);
+	     binding != (void *) target_tracee->fs->bindings.guest;
+	     binding = CIRCLEQ_NEXT(binding, link.guest)) {
+		if (strcmp(binding->guest.path, "/") == 0)
+			continue;
+
+		fprintf(fp, "%s %s bind rw,relatime 0 0\n",
+			binding->host.path, binding->guest.path);
+	}
+}
+
+static bool is_apex_mountpoint(const char *path, size_t length)
+{
+	return (length == 5 && memcmp(path, "/apex", 5) == 0) ||
+	       (length >= 6 && memcmp(path, "/apex/", 6) == 0);
+}
+
 static void mountinfo_check_open_path(Tracee *tracee, char path[PATH_MAX]) {
-	/* Try matching "/proc/<PID>/mountinfo"  */
+	/* Keep PID 1's global mount table on procfs. Redirecting this exact path
+	 * prevents Android init from booting on the target device. */
+	if (tracee->vpid == 1 && strcmp(path, "/proc/mounts") == 0)
+		return;
+
+	/* Try matching mountinfo/mounts paths in /proc. */
 	size_t len = strlen(path);
-	if (
-			len > (6 + 10) &&
-			0 == strncmp(path, "/proc/", 6) &&
-			0 == strcmp(path + (len - 10), "/mountinfo")
-	   ) {
-		/* Check if current root is under /data and if so replace contents
-		 * of /proc/<PID>/mountinfo to make it contain /data as / mountpoint.
-		 * This is needed because on Android / is read only mount
+	bool is_mountinfo = false;
+	bool is_mounts = false;
+	bool is_self = false;
+	const char *pid_path = NULL;
+	const char *table_suffix = NULL;
+	const char *table_name;
+	if (strcmp(path, "/proc/mounts") == 0) {
+		is_mounts = true;
+		is_self = true;
+	} else if (len > 6 && 0 == strncmp(path, "/proc/", 6)) {
+		if (len > (6 + 10) &&
+		    0 == strcmp(path + (len - 10), "/mountinfo")) {
+			is_mountinfo = true;
+			table_suffix = path + (len - 10);
+		} else if (len > (6 + 7) &&
+			   0 == strcmp(path + (len - 7), "/mounts")) {
+			is_mounts = true;
+			table_suffix = path + (len - 7);
+		} else {
+			return;
+		}
+		pid_path = path + 6;
+		if ((table_suffix - pid_path == 4 &&
+		     0 == memcmp(pid_path, "self", 4)) ||
+		    (table_suffix - pid_path == 11 &&
+		     0 == memcmp(pid_path, "thread-self", 11)))
+			is_self = true;
+	} else {
+		return;
+	}
+	table_name = is_mountinfo ? "mountinfo" : "mounts";
+
+	{
+		char real_path[PATH_MAX];
+		const char *path_to_open = path;
+		Tracee *target_tracee;
+		long target_pid;
+
+		/* PID virtualization leaves /proc/self intact so the kernel can
+		 * resolve it for the calling tracee.  Resolve it here as well,
+		 * otherwise this extension cannot filter the real mount table. */
+		if (is_self) {
+			target_tracee = tracee;
+			int status = snprintf(real_path, sizeof(real_path),
+					     "/proc/%d/%s", target_tracee->pid,
+					     table_name);
+			if (status < 0 || (size_t) status >= sizeof(real_path))
+				return;
+			path_to_open = real_path;
+		} else {
+			char *path_end = NULL;
+			target_pid = strtol(pid_path, &path_end, 10);
+			if (path_end != table_suffix || target_pid <= 0 ||
+			    target_pid > INT_MAX) {
+				return;
+			}
+			target_tracee = get_tracee(tracee, target_pid, false);
+			if (target_tracee == NULL)
+				return;
+		}
+		/* A root under /data needs a filtered view of the host mount table:
+		 * mountinfo gets its Android-specific root rewrite below, while the
+		 * mounts view hides host APEX mounts that belong to another runtime.
 		 *
 		 * https://github.com/termux/proot/issues/294
 		 */
-		char *path_end = NULL;
-		long target_pid = strtol(path + 6, &path_end, 10);
-		if (path_end != path + (len - 10) || target_pid <= 0 || target_pid > INT_MAX) {
+		/* Read the root binding directly.  Calling translate_path() here
+		 * would re-enter extension callbacks and overwrite per-syscall
+		 * path state while handling TRANSLATED_PATH. */
+		const char *root_path = get_root(target_tracee);
+		if (root_path == NULL)
 			return;
-		}
-		Tracee *target_tracee = get_tracee(tracee, target_pid, false);
-		if (target_tracee == NULL) {
-			return;
-		}
-
-		/* Check if our root is under "/data"  */
-		char root_path[PATH_MAX]; // Host path to guest root
-		translate_path(target_tracee, root_path, AT_FDCWD, "/", true);
 		Comparison compare_result = compare_paths(root_path, "/data");
 		bool is_android_data = (compare_result == PATH2_IS_PREFIX || compare_result == PATHS_ARE_EQUAL);
 
@@ -90,7 +167,7 @@ static void mountinfo_check_open_path(Tracee *tracee, char path[PATH_MAX]) {
 			return;
 
 		/* Open real /proc/<PID>/mountinfo  */
-		FILE *real_mountinfo_fp = fopen(path, "r");
+		FILE *real_mountinfo_fp = fopen(path_to_open, "r");
 		if (real_mountinfo_fp == NULL) {
 			return;
 		}
@@ -108,7 +185,29 @@ static void mountinfo_check_open_path(Tracee *tracee, char path[PATH_MAX]) {
 		ssize_t line_len = 0;
 		bool found_line = false;
 
-		if (is_android_data) {
+		if (is_android_data && is_mounts) {
+			while ((line_len = getline(&line, &line_buf_len,
+						   real_mountinfo_fp)) > 0) {
+				char *source_end = strchr(line, ' ');
+				char *mountpoint;
+				char *mountpoint_end;
+				size_t mount_len;
+
+				if (source_end == NULL)
+					continue;
+				mountpoint = source_end + 1;
+				mountpoint_end = strchr(mountpoint, ' ');
+				if (mountpoint_end == NULL)
+					continue;
+				mount_len = mountpoint_end - mountpoint;
+				if (is_apex_mountpoint(mountpoint, mount_len))
+					continue;
+
+				fwrite(line, line_len, 1, new_mountinfo_fp);
+				if (mount_len == 1 && mountpoint[0] == '/')
+					found_line = true;
+			}
+		} else if (is_android_data) {
 			while ((line_len = getline(&line, &line_buf_len, real_mountinfo_fp)) > 0) {
 				char *chunk = line;
 				/* Skip columns before 'root'  */
@@ -173,7 +272,10 @@ end_line_scan2: ;
 		/* Append synthesized entries for runtime bindings so
 		 * helpers like bubblewrap find the mounts they think
 		 * they just created.  */
-		append_runtime_binding_lines(target_tracee, new_mountinfo_fp);
+		if (is_mounts)
+			append_runtime_binding_mounts(target_tracee, new_mountinfo_fp);
+		else
+			append_runtime_binding_lines(target_tracee, new_mountinfo_fp);
 
 		free(line);
 		fclose(new_mountinfo_fp);
@@ -185,7 +287,6 @@ end_line_scan2: ;
 		}
 		return;
 	}
-
 }
 
 int mountinfo_callback(Extension *extension, ExtensionEvent event,

@@ -42,6 +42,11 @@ typedef struct {
 	 * granting capabilities to the host process. */
 	bool cap_virtualized;
 	bool cap_setpcap;
+	/* CAP_BLOCK_SUSPEND is advertised to fake-root userspace so callers
+	 * that require the capability can initialize. This is only a reported
+	 * capability; it does not grant the host process suspend privileges. */
+	bool cap_block_suspend_effective;
+	bool cap_block_suspend_permitted;
 	uint64_t cap_inh;
 	uint64_t cap_prm;
 	uint64_t cap_ambient;
@@ -55,6 +60,10 @@ typedef struct {
 	char *pending_path;
 	mode_t pending_mode;
 #endif
+
+	/* Fake-root descendants may request CAP_BLOCK_SUSPEND after changing
+	 * to a service UID. This only authorizes a virtual capget result. */
+	bool cap_block_suspend_virtualizable;
 } Config;
 
 #endif /* FAKE_ID0_CONFIG_H */

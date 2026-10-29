@@ -83,6 +83,13 @@ typedef struct tracee {
 	/* Process identifier. */
 	pid_t pid;
 
+	/* Identity of the host file-descriptor table shared by this task. */
+	uint64_t files_table_id;
+
+	/* Fail closed after a cross-process CLONE_FILES attempt, including
+	 * children which CLONE_UNTRACED keeps out of PRoot's tracee list. */
+	bool external_files_table_sharing;
+
 	/* Unique tracee identifier. */
 	uint64_t vpid;
 
@@ -285,6 +292,7 @@ typedef struct tracee {
 	 * syscall.  */
 	struct {
 		struct chained_syscalls *syscalls;
+		struct chained_syscall *current_syscall;
 		bool force_final_result;
 		word_t final_result;
 		enum {
@@ -425,7 +433,11 @@ extern bool has_ptracees(const Tracee *ptracer, pid_t pid, word_t wait_options);
 extern int new_child(Tracee *parent, word_t clone_flags);
 extern void resolve_pending_child(Tracee *parent);
 extern void adopt_held_children(void);
+extern void restart_deferred_child(Tracee *parent);
 extern Tracee *new_dummy_tracee(TALLOC_CTX *context);
+extern void tracee_reset_files_table(Tracee *tracee);
+extern int tracee_host_tgid(const Tracee *tracee, pid_t *tgid);
+extern bool tracee_has_external_files_table_sharing(const Tracee *tracee);
 extern void terminate_tracee(Tracee *tracee);
 extern void free_terminated_tracees();
 extern int swap_config(Tracee *tracee1, Tracee *tracee2);

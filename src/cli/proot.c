@@ -321,6 +321,15 @@ static int handle_option_link2symlink(Tracee *tracee, const Cli *cli UNUSED, con
 	return 0;
 }
 
+static int handle_option_fake_mount(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
+{
+	int status = initialize_extension(tracee, fake_mount_callback, NULL);
+
+	if (status < 0)
+		note(tracee, WARNING, INTERNAL, "fake-mount extension not initialized");
+	return 0;
+}
+
 #if defined(__ANDROID__) || defined(__BIONIC__)
 static int handle_option_ashmem_memfd(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
 {

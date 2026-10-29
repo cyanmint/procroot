@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: NONE
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Note: AI-generated contribution; no legal determination implied.
+ */
 /* -*- c-set-style: "K&R"; c-basic-offset: 8 -*-
  *
  * This file is part of PRoot.

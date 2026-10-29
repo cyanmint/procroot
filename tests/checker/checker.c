@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: NONE
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Note: AI-generated contribution; no legal determination implied.
+ */
 /* checker: a small self-contained diagnostic program that exercises
  * PRoot's "-N"/"--proc" PID-namespace virtualization (vPID/vTID
  * translation, "/proc" and "/sys" spoofing).  It has no dependency on
@@ -12,6 +17,7 @@
 
 #define _GNU_SOURCE
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,6 +31,8 @@
 #include <errno.h>
 #include <signal.h>
 #include <ctype.h>
+#include <sys/syscall.h>
+
 
 static int nb_checks = 0;
 static int nb_failures = 0;
@@ -168,6 +176,66 @@ static void check_proc_pid_status(void)
 		pid_field == getpid(), detail);
 }
 
+static long find_stat_ppid(const char *content)
+{
+	const char *command_end = strrchr(content, ')');
+	char state;
+	long ppid;
+
+	if (command_end == NULL
+	    || sscanf(command_end + 1, " %c %ld", &state, &ppid) != 2)
+		return -1;
+
+	return ppid;
+}
+
+static void check_proc_root_parent(void)
+{
+	char *content;
+	long ppid;
+	char detail[64];
+
+	content = slurp("/proc/1/status");
+	if (content == NULL) {
+		check("/proc/1/status PPid is virtualized", 0, strerror(errno));
+	} else {
+		ppid = find_field(content, "PPid:");
+		free(content);
+		snprintf(detail, sizeof(detail), "PPid=%ld (expected 0)", ppid);
+		check("/proc/1/status PPid is virtualized", ppid == 0, detail);
+	}
+
+	content = slurp("/proc/1/stat");
+	if (content == NULL) {
+		check("/proc/1/stat PPid is virtualized", 0, strerror(errno));
+	} else {
+		ppid = find_stat_ppid(content);
+		free(content);
+		snprintf(detail, sizeof(detail), "PPid=%ld (expected 0)", ppid);
+		check("/proc/1/stat PPid is virtualized", ppid == 0, detail);
+	}
+
+	content = slurp("/proc/self/status");
+	if (content == NULL) {
+		check("/proc/self/status PPid is virtualized", 0, strerror(errno));
+	} else {
+		ppid = find_field(content, "PPid:");
+		free(content);
+		snprintf(detail, sizeof(detail), "PPid=%ld (expected 0)", ppid);
+		check("/proc/self/status PPid is virtualized", ppid == 0, detail);
+	}
+
+	content = slurp("/proc/self/stat");
+	if (content == NULL) {
+		check("/proc/self/stat PPid is virtualized", 0, strerror(errno));
+	} else {
+		ppid = find_stat_ppid(content);
+		free(content);
+		snprintf(detail, sizeof(detail), "PPid=%ld (expected 0)", ppid);
+		check("/proc/self/stat PPid is virtualized", ppid == 0, detail);
+	}
+}
+
 static void check_proc_self_stat(void)
 {
 	char *content;
@@ -187,6 +255,81 @@ static void check_proc_self_stat(void)
 		stat_pid, (int) getpid());
 	check("/proc/self/stat first field matches getpid()",
 		stat_pid == getpid(), detail);
+}
+
+static void check_proc_task_stat_path(const char *name, const char *path,
+				      pid_t expected_tid)
+{
+	char *content;
+	int stat_tid = -1;
+	char detail[128];
+
+	content = slurp(path);
+	if (content == NULL) {
+		check(name, 0, strerror(errno));
+		return;
+	}
+
+	sscanf(content, "%d", &stat_tid);
+	free(content);
+
+	snprintf(detail, sizeof(detail), "stat tid=%d (gettid=%d)",
+		stat_tid, (int) expected_tid);
+	check(name, stat_tid == expected_tid, detail);
+}
+
+static void check_proc_task_stat(void)
+{
+	char path[128];
+	pid_t tid = (pid_t) syscall(SYS_gettid);
+
+	snprintf(path, sizeof(path), "/proc/%d/task/%d/stat",
+		(int) getpid(), (int) tid);
+	check_proc_task_stat_path("/proc/<vpid>/task/<vtid>/stat is virtualized",
+				  path, tid);
+
+	snprintf(path, sizeof(path), "/proc/self/task/%d/stat", (int) tid);
+	check_proc_task_stat_path("/proc/self/task/<vtid>/stat is virtualized",
+				  path, tid);
+}
+
+static void check_priority_vtid(void)
+{
+	pid_t tid = (pid_t) syscall(SYS_gettid);
+	int current_priority;
+	int target_priority;
+	int result;
+	char detail[128];
+
+	errno = 0;
+	current_priority = getpriority(PRIO_PROCESS, 0);
+	if (current_priority == -1 && errno != 0) {
+		check("getpriority(PRIO_PROCESS, 0)", 0, strerror(errno));
+		return;
+	}
+
+	errno = 0;
+	target_priority = getpriority(PRIO_PROCESS, (id_t) tid);
+	if (target_priority == -1 && errno != 0) {
+		check("getpriority(PRIO_PROCESS, gettid()) resolves guest TID",
+		      0, strerror(errno));
+		return;
+	}
+
+	snprintf(detail, sizeof(detail), "self=%d target=%d",
+		 current_priority, target_priority);
+	check("getpriority(PRIO_PROCESS, gettid()) resolves guest TID",
+	      target_priority == current_priority, detail);
+
+	errno = 0;
+	result = setpriority(PRIO_PROCESS, (id_t) tid, current_priority);
+	if (result < 0)
+		snprintf(detail, sizeof(detail), "tid=%d: %s", tid, strerror(errno));
+	else
+		snprintf(detail, sizeof(detail), "tid=%d priority=%d", tid,
+			 current_priority);
+	check("setpriority(PRIO_PROCESS, gettid()) resolves guest TID",
+	      result == 0, detail);
 }
 
 static void check_proc_self_readlink(void)
@@ -258,6 +401,108 @@ static void check_proc_listing(void)
 		(int) getpid(), seen_self, all_numeric_reasonable);
 	check("/proc listing contains self and looks virtualized",
 		seen_self && all_numeric_reasonable, detail);
+}
+
+static void check_proc_listing_via_dup(const char *name, int use_fcntl)
+{
+	int fd;
+	int duplicate_fd;
+	DIR *dir;
+	struct dirent *entry;
+	int seen_self = 0;
+	char detail[64];
+
+	fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd < 0) {
+		check(name, 0, strerror(errno));
+		return;
+	}
+
+	if (use_fcntl)
+		duplicate_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+	else
+		duplicate_fd = dup(fd);
+	if (duplicate_fd < 0) {
+		snprintf(detail, sizeof(detail), "duplicate: %s", strerror(errno));
+		close(fd);
+		check(name, 0, detail);
+		return;
+	}
+
+	dir = fdopendir(duplicate_fd);
+	if (dir == NULL) {
+		snprintf(detail, sizeof(detail), "fdopendir: %s", strerror(errno));
+		close(duplicate_fd);
+		close(fd);
+		check(name, 0, detail);
+		return;
+	}
+
+	while ((entry = readdir(dir)) != NULL) {
+		const char *digits = entry->d_name;
+		size_t i;
+		int numeric = digits[0] != '\0';
+
+		for (i = 0; digits[i] != '\0'; i++) {
+			if (!isdigit((unsigned char) digits[i])) {
+				numeric = 0;
+				break;
+			}
+		}
+		if (numeric && strtol(digits, NULL, 10) == (long) getpid())
+			seen_self = 1;
+	}
+	closedir(dir);
+	close(fd);
+
+	snprintf(detail, sizeof(detail), "self(%d) listed=%d",
+		 (int) getpid(), seen_self);
+	check(name, seen_self, detail);
+}
+
+static void check_proc_relative_openat(void)
+{
+	int proc_fd;
+	int stat_fd;
+	char path[64];
+	char content[256];
+	char detail[128];
+	long stat_pid = -1;
+	ssize_t count;
+
+	proc_fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (proc_fd < 0) {
+		check("openat(/proc dirfd, vPID/stat) is virtualized", 0,
+		      strerror(errno));
+		return;
+	}
+
+	snprintf(path, sizeof(path), "%d/stat", (int) getpid());
+	stat_fd = openat(proc_fd, path, O_RDONLY | O_CLOEXEC);
+	if (stat_fd < 0) {
+		snprintf(detail, sizeof(detail), "openat %s: %s", path,
+			 strerror(errno));
+		close(proc_fd);
+		check("openat(/proc dirfd, vPID/stat) is virtualized", 0, detail);
+		return;
+	}
+
+	count = read(stat_fd, content, sizeof(content) - 1);
+	close(stat_fd);
+	close(proc_fd);
+	if (count <= 0) {
+		check("openat(/proc dirfd, vPID/stat) is virtualized", 0,
+		      count < 0 ? strerror(errno) : "empty stat file");
+		return;
+	}
+
+	content[count] = '\0';
+	if (sscanf(content, "%ld", &stat_pid) != 1)
+		stat_pid = -1;
+	snprintf(detail, sizeof(detail), "stat pid=%ld (getpid=%d)", stat_pid,
+		 (int) getpid());
+	check("openat(/proc dirfd, vPID/stat) is virtualized",
+	      stat_pid == (long) getpid(), detail);
 }
 
 static void check_sys_mirrored(void)
@@ -488,9 +733,15 @@ int main(void)
 	check_getpid_is_1();
 	check_proc_self_status();
 	check_proc_pid_status();
+	check_proc_root_parent();
 	check_proc_self_stat();
+	check_proc_task_stat();
+	check_priority_vtid();
 	check_proc_self_readlink();
 	check_proc_listing();
+	check_proc_relative_openat();
+	check_proc_listing_via_dup("dup(/proc) preserves virtual PID entries", 0);
+	check_proc_listing_via_dup("fcntl(F_DUPFD_CLOEXEC) preserves virtual PID entries", 1);
 	check_sys_mirrored();
 	check_sys_cpu_possible();
 	check_sys_write_spoof();

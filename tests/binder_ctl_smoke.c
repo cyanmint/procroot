@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: NONE
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Note: AI-generated contribution; no legal determination implied.
+ */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>

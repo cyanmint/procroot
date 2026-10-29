@@ -81,9 +81,11 @@ OBJECTS += \
         extension/fake_id0/helper_functions.o \
 	extension/fake_id0/fake_id0.o \
 	extension/hidden_files/hidden_files.o \
-	extension/mountinfo/mountinfo.o \
-	extension/port_switch/port_switch.o \
+		extension/mountinfo/mountinfo.o \
+		extension/fake_mount/fake_mount.o \
+		extension/port_switch/port_switch.o \
 	extension/pid_virt/pid_virt.o \
+	extension/binder/fda_courier.o \
 	extension/binder/binder.o \
 	extension/sysvipc/sysvipc.o \
 	extension/sysvipc/sysvipc_msg.o \

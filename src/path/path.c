@@ -341,9 +341,22 @@ int translate_path(Tracee *tracee, char result[PATH_MAX], int dir_fd,
 
 		/* Remove the leading "root" part of the base
 		 * (required!). */
-		status = detranslate_path(tracee, result, NULL);
-		if (status < 0)
-			return status;
+		if (strcmp(result, "/proc") != 0 ||
+		    get_extension(tracee, pid_virt_callback) == NULL) {
+			status = detranslate_path(tracee, result, NULL);
+			if (status < 0)
+				return status;
+		}
+		if (get_extension(tracee, pid_virt_callback) != NULL
+		    && strncmp(result, "/proc/", 6) == 0) {
+			status = notify_extensions(tracee, PROC_DIRFD_PATH,
+						   (intptr_t) result, 0);
+			if (status < 0)
+				return status;
+		}
+		/* With PID virtualization enabled, host /proc is the guest's
+		 * virtual procfs.  Keep this dirfd base in the guest namespace so
+		 * the GUEST_PATH handler can translate relative openat() paths. */
 	}
 	/* It is relative to the current working directory.  */
 	else {

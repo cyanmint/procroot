@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: NONE
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Note: AI-generated contribution; no legal determination implied.
+ */
 #include <errno.h>
 #include <stdio.h>
 #include <sys/prctl.h>

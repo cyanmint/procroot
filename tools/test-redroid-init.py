@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: NONE
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Note: AI-generated contribution; no legal determination implied.
 """Bounded Redroid init/ADB integration test; must run as a non-root user."""
 import argparse
 import os

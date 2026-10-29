@@ -29,6 +29,11 @@
 #include "tracee/tracee.h"
 #include "syscall/seccomp.h"
 
+typedef struct {
+	uint64_t old_id;
+	uint64_t new_id;
+} FilesTableChange;
+
 /* List of possible events.  */
 typedef enum {
 	/* A guest path passed as an argument of the current syscall
@@ -38,6 +43,12 @@ typedef enum {
 	 * its own handling.  If the extension returns < 0, then PRoot
 	 * reports this errno as-is.  */
 	GUEST_PATH,
+
+	/* A relative path is being resolved against a directory fd:
+	 * "(char *) data1" is the host path reported for that descriptor.
+	 * Extensions may rewrite it before GUEST_PATH handles the relative
+	 * path.  A negative return aborts path translation.  */
+	PROC_DIRFD_PATH,
 
 	/* A canonicalized host path is being accessed during the
 	 * translation of a guest path: "(char *) data1" is the
@@ -94,6 +105,11 @@ typedef enum {
 	 * waitpid(2).  If the extension returns != 0, then PRoot
 	 * skips its own handling.  */
 	NEW_STATUS,
+
+	/* The tracee's file-table identity changed after execve(2) or a
+	 * fork-like clone(2) copied its file table: "(const
+	 * FilesTableChange *) data1" contains the old and new identities. */
+	FILES_TABLE_CHANGED,
 
 	/* Ask how this extension is inheritable: "(Tracee *) data1"
 	 * is the child tracee and "(bool) data2" is the clone(2)
@@ -235,6 +251,7 @@ extern int fix_symlink_size_callback(Extension *extension, ExtensionEvent event,
 extern int ashmem_memfd_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
 #endif /* defined(__ANDROID__) || defined(__BIONIC__) */
 extern int mountinfo_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
+extern int fake_mount_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
 extern int pid_virt_callback(Extension *extension, ExtensionEvent event, intptr_t d1, intptr_t d2);
 extern bool pid_virt_binding_conflicts(Tracee *tracee);
 

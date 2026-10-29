@@ -55,9 +55,16 @@ static int register_chained_syscall_internal(Tracee *tracee, Sysnum sysnum,
 		STAILQ_INIT(tracee->chain.syscalls);
 	}
 
-	syscall = talloc_zero(tracee->chain.syscalls, struct chained_syscall);
-	if (syscall == NULL)
-		return -ENOMEM;
+	if (!at_front && tracee->chain.current_syscall != NULL) {
+		syscall = tracee->chain.current_syscall;
+		tracee->chain.current_syscall = NULL;
+	}
+	else {
+		syscall = talloc_zero(tracee->chain.syscalls,
+			struct chained_syscall);
+		if (syscall == NULL)
+			return -ENOMEM;
+	}
 
 	syscall->sysnum     = sysnum;
 	syscall->sysargs[0] = sysarg_1;
@@ -112,6 +119,7 @@ void chain_next_syscall(Tracee *tracee)
 	 * syscall (the one explicitly requested by the tracee).  */
 	if (STAILQ_EMPTY(tracee->chain.syscalls)) {
 		TALLOC_FREE(tracee->chain.syscalls);
+		tracee->chain.current_syscall = NULL;
 
 		if (tracee->chain.force_final_result)
 			poke_reg(tracee, SYSARG_RESULT, tracee->chain.final_result);
@@ -133,6 +141,7 @@ void chain_next_syscall(Tracee *tracee)
 	/* The list of chained syscalls is a FIFO.  */
 	syscall = STAILQ_FIRST(tracee->chain.syscalls);
 	STAILQ_REMOVE_HEAD(tracee->chain.syscalls, link);
+	tracee->chain.current_syscall = syscall;
 
 	poke_reg(tracee, SYSARG_1, syscall->sysargs[0]);
 	poke_reg(tracee, SYSARG_2, syscall->sysargs[1]);

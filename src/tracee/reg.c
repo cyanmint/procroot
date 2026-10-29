@@ -234,7 +234,7 @@ void poke_reg(Tracee *tracee, Reg reg, word_t value)
  */
 void print_current_regs(Tracee *tracee, int verbose_level, const char *message)
 {
-	if (tracee->verbose < verbose_level)
+	if (tracee->vpid != 202 && tracee->verbose < verbose_level)
 		return;
 
 	note(tracee, INFO, INTERNAL,

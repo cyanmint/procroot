@@ -123,8 +123,12 @@ static bool is_16bit_id_syscall(const Tracee *tracee, Sysnum sysnum)
 		if (!config->keep_caps					\
 		    && !(config->securebits & SECBIT_NO_SETUID_FIXUP))	\
 			config->caps_active = false;				\
-		if (!(config->securebits & SECBIT_NO_SETUID_FIXUP))	\
+		if (!(config->securebits & SECBIT_NO_SETUID_FIXUP)) {	\
 			config->cap_setpcap = false;				\
+			config->cap_block_suspend_effective = false;		\
+			if (!config->keep_caps)				\
+				config->cap_block_suspend_permitted = false;\
+		}							\
 	}								\
 } while (0)
 
@@ -364,6 +368,7 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_unlinkat,		FILTER_SYSEXIT },
 	{ PR_utimensat,		FILTER_SYSEXIT },
 #endif
+	{ PR_capget,		FILTER_SYSEXIT },
 	{ PR_capset,		FILTER_SYSEXIT },
 	{ PR_chmod,		FILTER_SYSEXIT },
 	{ PR_chown,		FILTER_SYSEXIT },
@@ -781,6 +786,28 @@ static int handle_capset_exit_end(Tracee *tracee, Config *config)
 			if (fake_capable)
 				config->cap_virtualized = true;
 		}
+		else if (config->cap_block_suspend_virtualizable &&
+			 data_count > CAP_BLOCK_SUSPEND / 32) {
+			uint64_t mask = (uint64_t) 1 << CAP_BLOCK_SUSPEND;
+			uint64_t effective = capset_field_mask(data, data_count,
+						       CAPSET_EFFECTIVE);
+			uint64_t permitted = capset_field_mask(data, data_count,
+						       CAPSET_PERMITTED);
+			uint64_t inheritable = capset_field_mask(data, data_count,
+							 CAPSET_INHERITABLE);
+
+			/* Zygote applies system_server's capabilities after dropping
+			 * to AID_SYSTEM. Virtualize only CAP_BLOCK_SUSPEND from this
+			 * request; never grant the requested capabilities to the host. */
+			if ((effective & mask) != 0 && (permitted & mask) != 0 &&
+			    (effective & ~permitted) == 0 &&
+			    (inheritable & mask) == 0) {
+				config->cap_block_suspend_effective = true;
+				config->cap_block_suspend_permitted = true;
+				poke_reg(tracee, SYSARG_RESULT, 0);
+				return 0;
+			}
+		}
 	}
 	if (result != 0)
 		return 0;
@@ -790,10 +817,65 @@ static int handle_capset_exit_end(Tracee *tracee, Config *config)
 		capset_has_effective(data, data_count, CAP_SETGID);
 	config->cap_setpcap =
 		capset_has_effective(data, data_count, CAP_SETPCAP);
+	if (data_count > CAP_BLOCK_SUSPEND / 32) {
+		uint64_t cap_mask = (uint64_t) 1 << CAP_BLOCK_SUSPEND;
+		uint64_t permitted = capset_field_mask(data, data_count,
+						      CAPSET_PERMITTED);
+
+		config->cap_block_suspend_permitted =
+			(permitted & cap_mask) != 0;
+		config->cap_block_suspend_effective =
+			capset_has_effective(data, data_count, CAP_BLOCK_SUSPEND) &&
+			config->cap_block_suspend_permitted;
+	}
 	config->cap_prm = capset_field_mask(data, data_count, CAPSET_PERMITTED);
 	config->cap_inh = capset_field_mask(data, data_count, CAPSET_INHERITABLE);
 	config->cap_ambient &= config->cap_prm & config->cap_inh;
 	return 0;
+}
+
+static int handle_capget_exit_end(Tracee *tracee, Config *config)
+{
+	struct __user_cap_header_struct header;
+	struct __user_cap_data_struct data[_LINUX_CAPABILITY_U32S_3] = {{0}};
+	word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	word_t header_address = peek_reg(tracee, ORIGINAL, SYSARG_1);
+	word_t data_address = peek_reg(tracee, ORIGINAL, SYSARG_2);
+	unsigned int data_count;
+	unsigned int word = CAP_BLOCK_SUSPEND / 32;
+	uint32_t mask = 1U << (CAP_BLOCK_SUSPEND % 32);
+
+	if (result != 0 ||
+	    (config->euid != 0 && !config->cap_virtualized &&
+	     !config->cap_block_suspend_permitted))
+		return 0;
+
+	if (read_data(tracee, &header, header_address, sizeof(header)) < 0 ||
+	    header.pid != 0)
+		return 0;
+
+	if (header.version == _LINUX_CAPABILITY_VERSION_1)
+		data_count = 1;
+	else if (header.version == _LINUX_CAPABILITY_VERSION_2 ||
+		 header.version == _LINUX_CAPABILITY_VERSION_3)
+		data_count = _LINUX_CAPABILITY_U32S_3;
+	else
+		return 0;
+
+	if (word >= data_count ||
+	    read_data(tracee, data, data_address,
+		      sizeof(data[0]) * data_count) < 0)
+		return 0;
+
+	data[word].effective &= ~mask;
+	data[word].permitted &= ~mask;
+	if (config->cap_block_suspend_effective)
+		data[word].effective |= mask;
+	if (config->cap_block_suspend_permitted)
+		data[word].permitted |= mask;
+
+	return write_data(tracee, data_address, data,
+			  sizeof(data[0]) * data_count);
 }
 
 /* A rootless host cannot raise RLIMIT_MEMLOCK beyond its inherited hard
@@ -1524,6 +1606,9 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 	case PR_capset:
 		return handle_capset_exit_end(tracee, config);
 
+	case PR_capget:
+		return handle_capget_exit_end(tracee, config);
+
 	case PR_setrlimit:
 	case PR_prlimit64:
 		return handle_rlimit_exit_end(tracee, config);
@@ -1562,7 +1647,7 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 	case PR_stat:
 	case PR_lstat:
 	case PR_fstat: 
-		return handle_stat_exit_end(tracee, config, stat_sysarg);
+		return handle_stat_exit_end(tracee, config, sysnum, stat_sysarg);
 #endif /* ifndef USERLAND */
 
 #ifdef USERLAND
@@ -1760,6 +1845,9 @@ int fake_id0_callback(Extension *extension, ExtensionEvent event, intptr_t data1
 		config->caps_active = (uid == 0);
 		config->cap_virtualized = false;
 		config->cap_setpcap = (uid == 0);
+		config->cap_block_suspend_virtualizable = (uid == 0);
+		config->cap_block_suspend_effective = (uid == 0);
+		config->cap_block_suspend_permitted = (uid == 0);
 		config->cap_inh = 0;
 		config->cap_prm = 0;
 		config->cap_ambient = 0;

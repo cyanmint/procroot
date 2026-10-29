@@ -36,6 +36,13 @@ check-test-securebits.c: $(ROOTFS)/bin/test-securebits setup
 check-test-capset-drop.c: $(ROOTFS)/bin/test-capset-drop setup
 	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$*)
 
+check-test-capget-fake-root.c: $(ROOTFS)/bin/test-capget-fake-root setup
+	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$* root)
+	$(call check_c,$*,$(PROOT) -b /proc -r $(ROOTFS) /bin/$* nonroot)
+	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$* clear)
+	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$* drop)
+	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$* system)
+
 check-test-ambient-caps.c: $(ROOTFS)/bin/test-ambient-caps setup
 	$(call check_c,$*,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/$*)
 
@@ -47,6 +54,116 @@ check-test-binder-context-manager.c: test-binder-context-manager
 
 check-test-binder-epoll.c: test-binder-epoll
 	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-poll-notify.c: test-binder-poll-notify
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-read-word-backlog.c: test-binder-read-word-backlog
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-buffer-capacity.c: test-binder-buffer-capacity
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-mmap-transaction.c: test-binder-mmap-transaction
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-zero-payload.c: test-binder-zero-payload
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-free-unknown-buffer.c: test-binder-free-unknown-buffer
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-socket-shutdown.c: test-binder-socket-shutdown
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-security-context.c: test-binder-security-context
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-death-notification.c: test-binder-death-notification
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-death-owner-exit.c: test-binder-death-owner-exit
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-dead-handle-lifetime.c: test-binder-dead-handle-lifetime
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-refcount.c: test-binder-refcount
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-scatter-gather.c: test-binder-scatter-gather
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-fda-peer-credentials.c: test-binder-fda-peer-credentials
+	$(call check_c,$<,./$<)
+
+check-test-binder-fda-scratch.c: test-binder-fda-scratch
+	$(call check_c,$<,./$<)
+
+check-test-syscall-chain-reuse.c: test-syscall-chain-reuse
+	$(call check_c,$<,./$<)
+
+check-test-pthread-atfork.c: test-pthread-atfork
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-fork-child-exit-race.c: test-fork-child-exit-race
+	$(call check_c,$<,$(PROOT) -N ./$<)
+
+check-test-binder-thread-routing.c: test-binder-thread-routing
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-thread-reply-routing.c: test-binder-thread-reply-routing
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-deferred-reply-frame.c: test-binder-deferred-reply-frame
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-dead-sender-reply.c: test-binder-dead-sender-reply
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-queued-reply-identity.c: test-binder-queued-reply-identity
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-shared-thread-fd-domain.c: test-binder-shared-thread-fd-domain
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-fd-domain-transfer.c: test-binder-fd-domain-transfer
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-nested-transaction.c: test-binder-nested-transaction
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-handle-translation.c: test-binder-handle-translation
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-hwbinder-handle-translation.c: test-binder-hwbinder-handle-translation
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-transfer-refcount.c: test-binder-transfer-refcount
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-reply-acquire.c: test-binder-reply-acquire
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-domain-isolation.c: test-binder-domain-isolation
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binder-domain-queue.c: test-binder-domain-queue
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-binderfs-feature-path.sh: test-binderfs-feature-path
+
+check-test-proot-properties-dir.c: test-proot-properties-dir
+	$(call check_c,$<,$(PROOT) -B -0 ./$<)
+
+check-test-proc-self-fd-realpath.c: test-proc-self-fd-realpath
+	$(call check_c,$<,$(PROOT) -N -B -0 ./$<)
+
+check-test-proc-pid-dirfd.c: test-proc-pid-dirfd
+	$(call check_c,$<,$(PROOT) -N -B -0 ./$<)
+
+check-test-pid-virt-sched.c: test-pid-virt-sched
+	$(call check_c,$<,$(PROOT) -N -B -0 ./$<)
 
 # Not supported anymore.
 # check-test-af062114.c: test-af062114
@@ -172,6 +289,111 @@ $(ROOTFS)/bin/%: %.c
 
 # Special cases.
 test-bdc90417: test-bdc90417.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-pthread-atfork: test-pthread-atfork.c
+	$(Q)$(CC) -pthread $< -o $@ $(silently) || true
+
+test-fork-child-exit-race: test-fork-child-exit-race.c
+	$(Q)$(CC) -pthread $< -o $@ $(silently) || true
+
+test-binder-refcount: test-binder-refcount.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-zero-payload: test-binder-zero-payload.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-free-unknown-buffer: test-binder-free-unknown-buffer.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-buffer-capacity: test-binder-buffer-capacity.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-socket-shutdown: test-binder-socket-shutdown.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-security-context: test-binder-security-context.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-death-notification: test-binder-death-notification.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-death-owner-exit: test-binder-death-owner-exit.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-dead-handle-lifetime: test-binder-dead-handle-lifetime.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-scatter-gather: test-binder-scatter-gather.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-fda-peer-credentials: test-binder-fda-peer-credentials.c ../src/extension/binder/fda_courier.c
+	$(Q)$(CC) -I../src $^ -o $@ $(silently) || true
+
+test-binder-fda-scratch: test-binder-fda-scratch.c ../src/extension/binder/fda_courier.c
+	$(Q)$(CC) -I../src $^ -o $@ $(silently) || true
+
+test-syscall-chain-reuse: test-syscall-chain-reuse.c ../src/syscall/chain.c
+	$(Q)$(CC) -I../src $^ -ltalloc -o $@ $(silently) || true
+
+test-binder-thread-routing: test-binder-thread-routing.c
+	$(Q)$(CC) $< -pthread -o $@ $(silently) || true
+
+test-binder-thread-reply-routing: test-binder-thread-reply-routing.c
+	$(Q)$(CC) $< -pthread -o $@ $(silently) || true
+
+test-binder-deferred-reply-frame: test-binder-deferred-reply-frame.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-queued-reply-identity: test-binder-queued-reply-identity.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-shared-thread-fd-domain: test-binder-shared-thread-fd-domain.c
+	$(Q)$(CC) $< -pthread -o $@ $(silently) || true
+
+test-binder-fd-domain-transfer: test-binder-fd-domain-transfer.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-nested-transaction: test-binder-nested-transaction.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-handle-translation: test-binder-handle-translation.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-hwbinder-handle-translation: test-binder-handle-translation.c
+	$(Q)$(CC) -DBINDER_DEVICE_PATH='"/dev/hwbinder"' $< -o $@ $(silently) || true
+
+test-binder-transfer-refcount: test-binder-transfer-refcount.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-reply-acquire: test-binder-reply-acquire.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-domain-isolation: test-binder-domain-isolation.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-domain-queue: test-binder-domain-queue.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-poll-notify: test-binder-poll-notify.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binder-read-word-backlog: test-binder-read-word-backlog.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-binderfs-feature-path: test-binderfs-feature-path.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-proot-properties-dir: test-proot-properties-dir.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-proc-self-fd-realpath: test-proc-self-fd-realpath.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-proc-pid-dirfd: test-proc-pid-dirfd.c
+	$(Q)$(CC) $< -o $@ $(silently) || true
+
+test-pid-virt-sched: test-pid-virt-sched.c
 	$(Q)$(CC) $< -o $@ $(silently) || true
 
 # Not supported anymore.

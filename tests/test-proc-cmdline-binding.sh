@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: NONE
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Note: AI-generated contribution; no legal determination implied.
 set -eu
 
 : "${PROOT:?PROOT must name the procroot executable}"

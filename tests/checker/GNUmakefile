@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: NONE
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Note: AI-generated contribution; no legal determination implied.
 # Standalone build for the "-N"/"--proc" PID-namespace virtualization
 # checker.  It has no dependency on PRoot's own build system: it is a
 # single self-contained C program meant to be run *under* PRoot.

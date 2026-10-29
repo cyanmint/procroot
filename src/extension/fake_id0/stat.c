@@ -15,7 +15,32 @@
 #include "tracee/statx.h"
 
 #ifndef USERLAND
-int handle_stat_exit_end(Tracee *tracee, Config *config, Reg stat_sysarg) {
+static bool is_android_property_area_path(Tracee *tracee, word_t sysnum)
+{
+	char path[PATH_MAX];
+	char properties_path[PATH_MAX];
+	int status;
+	Comparison comparison;
+
+	if (sysnum == PR_fstat || sysnum == PR_fstat64)
+		status = get_fd_path(tracee, path, SYSARG_1, ORIGINAL);
+	else if (sysnum == PR_fstatat64 || sysnum == PR_newfstatat)
+		status = read_sysarg_path(tracee, path, SYSARG_2, ORIGINAL);
+	else
+		status = read_sysarg_path(tracee, path, SYSARG_1, ORIGINAL);
+	if (status < 0)
+		return false;
+
+	if (translate_path(tracee, properties_path, AT_FDCWD,
+			   "/dev/__properties__", true) < 0)
+		return false;
+
+	comparison = compare_paths(properties_path, path);
+	return comparison == PATHS_ARE_EQUAL || comparison == PATH1_IS_PREFIX;
+}
+
+int handle_stat_exit_end(Tracee *tracee, Config *config, word_t sysnum,
+			 Reg stat_sysarg) {
 	word_t address;
 	uid_t uid;
 	gid_t gid;
@@ -27,6 +52,11 @@ int handle_stat_exit_end(Tracee *tracee, Config *config, Reg stat_sysarg) {
 		return 0;
 
 	address = peek_reg(tracee, ORIGINAL, stat_sysarg);
+	if (is_android_property_area_path(tracee, sysnum)) {
+		poke_uint32(tracee, address + offsetof_stat_uid(tracee), 0);
+		poke_uint32(tracee, address + offsetof_stat_gid(tracee), 0);
+		return 0;
+	}
 
 	/* Sanity checks.  */
 	assert(__builtin_types_compatible_p(uid_t, uint32_t));

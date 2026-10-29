@@ -61,6 +61,7 @@ static int handle_option_i(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_R(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_S(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_link2symlink(Tracee *tracee, const Cli *cli, const char *value);
+static int handle_option_fake_mount(Tracee *tracee, const Cli *cli, const char *value);
 #if defined(__ANDROID__) || defined(__BIONIC__)
 static int handle_option_ashmem_memfd(Tracee *tracee, const Cli *cli, const char *value);
 #endif /* defined(__ANDROID__) || defined(__BIONIC__) */
@@ -245,6 +246,14 @@ Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
 	  .description = "Replace hard links with symlinks, pretending they are really hardlinks",
 	  .detail = "\tEmulates hard links with symbolic links when SELinux policies\n\
 \tdo not allow hard links.",
+	},
+	{ .class = "Extension options",
+	  .arguments = {
+		{ .name = "--fake-mount", .separator = '\0', .value = NULL },
+		{ .name = NULL, .separator = '\0', .value = NULL } },
+	  .handler = handle_option_fake_mount,
+	  .description = "Extract and emulate ext4/EROFS APEX mounts without host loop/DM access.",
+	  .detail = "",
 	},
 	{ .class = "Extension options",
 	  .arguments = {

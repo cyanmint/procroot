@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: NONE
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Note: AI-generated contribution; no legal determination implied.
+ */
 /* -*- c-set-style: "K&R"; c-basic-offset: 8 -*-
  *
  * This file is part of PRoot.
@@ -11,14 +16,15 @@
  *   - translating PID-retrieval syscalls (getpid, getppid, gettid,
  *     getpgid, getsid) from host PID to vPID at sys-exit;
  *   - translating PID-targeting syscalls (kill, tgkill, tkill,
- *     ptrace, sched_{set,get}affinity) from vPID to host PID at
- *     sys-enter;
+ *     ptrace, scheduler, and PRIO_PROCESS priority calls) from vPID
+ *     to host PID at sys-enter;
  *   - patching back the vPID/vTID into CLONE_PARENT_SETTID /
  *     CLONE_CHILD_SETTID target addresses;
- *   - virtualizing /proc: rewriting "/proc/<vpid>/..." guest accesses
- *     to "/proc/<host_pid>/...", filtering and renaming entries
- *     returned by getdents64() on the "/proc" directory, and patching
- *     the PID fields found in "status"/"stat" file contents.
+ *   - virtualizing /proc: rewriting "/proc/<vpid>/..." and
+ *     "/proc/<vpid>/task/<vtid>/..." guest accesses to their host
+ *     paths, filtering and renaming entries returned by getdents64()
+ *     on the "/proc" directory, and patching PID fields in
+ *     "status"/"stat" file contents.
  */
 
 #include <string.h>      /* str*(3), mem*(3), */
@@ -27,10 +33,13 @@
 #include <errno.h>       /* E*, */
 #include <ctype.h>       /* isdigit(3), */
 #include <inttypes.h>    /* PRIu64, */
+#include <limits.h>      /* INT_MAX, */
 #include <stddef.h>      /* offsetof(3), */
 #include <fcntl.h>       /* O_*, AT_FDCWD, */
+#include <unistd.h>      /* getpid(2), */
 #include <linux/sched.h> /* CLONE_*, */
 #include <signal.h>      /* siginfo_t, */
+#include <sys/resource.h> /* PRIO_PROCESS, */
 #include <sys/ptrace.h>  /* PTRACE_GETSIGINFO, PTRACE_SETSIGINFO, */
 #include <sys/wait.h>    /* P_PID, P_PGID, */
 
@@ -63,6 +72,20 @@ static FilteredSysnum filtered_sysnums[] = {
 	{ PR_setpgid,		0 },
 	{ PR_sched_setaffinity,	0 },
 	{ PR_sched_getaffinity,	0 },
+	{ PR_sched_setparam,	0 },
+	{ PR_sched_getparam,	0 },
+	{ PR_sched_setscheduler,	0 },
+	{ PR_sched_getscheduler,	0 },
+	{ PR_sched_rr_get_interval, 0 },
+	{ PR_sched_setattr,	0 },
+	{ PR_sched_getattr,	0 },
+	{ PR_setpriority,		0 },
+	{ PR_getpriority,	0 },
+	{ PR_dup,		FILTER_SYSEXIT },
+	{ PR_dup2,		FILTER_SYSEXIT },
+	{ PR_dup3,		FILTER_SYSEXIT },
+	{ PR_fcntl,		FILTER_SYSEXIT },
+	{ PR_fcntl64,		FILTER_SYSEXIT },
 	{ PR_getdents64,	FILTER_SYSEXIT },
 	{ PR_read,		FILTER_SYSEXIT },
 	{ PR_lseek,		FILTER_SYSEXIT },
@@ -127,7 +150,8 @@ static FilteredSysnum filtered_sysnums[] = {
 typedef enum {
 	PROC_FD_NONE = 0,
 	PROC_FD_ROOT,    /* fd opened on "/proc" itself (getdents64).  */
-	PROC_FD_STATUS,  /* fd opened on "/proc/<pid>/status".         */
+	PROC_FD_TASK,    /* fd opened on "/proc/<pid>/task".             */
+	PROC_FD_STATUS,  /* fd opened on "/proc/<pid>/status".           */
 	PROC_FD_STAT,    /* fd opened on "/proc/<pid>/stat".           */
 	PROC_FD_STATM,   /* fd opened on "/proc/<pid>/statm".          */
 	SYS_FD_GENERIC,  /* fd opened somewhere under "/sys".          */
@@ -136,7 +160,7 @@ typedef enum {
 
 typedef struct {
 	int fd;
-	pid_t host_pid; /* Meaningful for STATUS/STAT/STATM only.  */
+	pid_t host_pid; /* Meaningful for PID-backed proc entries.  */
 	ProcFdKind kind;
 	size_t offset;
 	int value;
@@ -293,10 +317,125 @@ static void untrack_fd(Config *config, int fd)
 	}
 }
 
+static void copy_tracked_fd(Config *config, int source_fd, int target_fd)
+{
+	TrackedFd *source;
+	TrackedFd *target;
+	TrackedFd saved;
+
+	if (source_fd == target_fd)
+		return;
+
+	source = find_tracked_fd(config, source_fd);
+	if (source != NULL)
+		saved = *source;
+
+	/* dup2()/dup3() can replace a descriptor that was tracked before.  */
+	untrack_fd(config, target_fd);
+	if (source == NULL)
+		return;
+
+	track_fd(config, target_fd, saved.host_pid, saved.kind);
+	target = find_tracked_fd(config, target_fd);
+	if (target != NULL) {
+		target->offset = saved.offset;
+		target->value = saved.value;
+	}
+}
+
+static void handle_dup_exit(Tracee *tracee, Config *config, Sysnum sysnum)
+{
+	int old_fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
+	int new_fd;
+	int64_t result = (int64_t) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+
+	if (result < 0)
+		return;
+
+	switch (sysnum) {
+	case PR_dup2:
+	case PR_dup3:
+		new_fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_2);
+		break;
+
+	case PR_fcntl:
+	case PR_fcntl64: {
+		int command = (int) peek_reg(tracee, ORIGINAL, SYSARG_2);
+		if (command != F_DUPFD && command != F_DUPFD_CLOEXEC)
+			return;
+		new_fd = (int) result;
+		break;
+	}
+
+	default:
+		new_fd = (int) result;
+		break;
+	}
+
+	copy_tracked_fd(config, old_fd, new_fd);
+}
+
+/**
+ * Translate a nested "/proc/<pid>/task/<tid>" path component.  @leaf
+ * starts immediately after the process component and is updated to the
+ * remaining path after the thread ID when a rewrite is performed.
+ */
+static int rewrite_proc_task_path(Tracee *tracee, char result[PATH_MAX],
+				 const char **leaf, pid_t *host_pid)
+{
+	const char *tid_component;
+	const char *slash;
+	char component[NAME_MAX + 1];
+	size_t complen;
+	uint64_t vtid;
+	pid_t host_tgid;
+	pid_t host_tid;
+	Tracee *target;
+	int status;
+
+	if (strncmp(*leaf, "task/", 5) != 0)
+		return 0;
+
+	tid_component = *leaf + 5;
+	slash = strchr(tid_component, '/');
+	complen = slash != NULL ? (size_t) (slash - tid_component)
+			       : strlen(tid_component);
+	if (complen == 0 || complen > NAME_MAX)
+		return 0;
+
+	memcpy(component, tid_component, complen);
+	component[complen] = '\0';
+	if (strspn(component, "0123456789") != complen)
+		return 0;
+
+	vtid = strtoull(component, NULL, 10);
+	target = get_tracee_by_vpid(vtid);
+	if (target != NULL) {
+		host_tid = target->pid;
+	}
+	else {
+		host_tid = (pid_t) vtid;
+		if (host_tid <= 0 || (uint64_t) host_tid != vtid
+		    || get_tracee(tracee, host_tid, false) == NULL)
+			return -ENOENT;
+	}
+
+	host_tgid = *host_pid;
+	status = snprintf(result, PATH_MAX, "/proc/%d/task/%d%s%s",
+			host_tgid, host_tid, slash != NULL ? "/" : "",
+			slash != NULL ? slash + 1 : "");
+	if (status < 0 || status >= PATH_MAX)
+		return -ENAMETOOLONG;
+
+	*leaf = slash != NULL ? slash + 1 : "";
+	*host_pid = host_tid;
+	return 1;
+}
+
 /**
  * Rewrite a guest path targeting "/proc" so that it is directly
- * usable on the host, translating any leading "/proc/<vpid>"
- * component into "/proc/<host_pid>".  @full is the absolute,
+ * usable on the host, translating a leading "/proc/<vpid>" component
+ * and any nested "/task/<vtid>" component.  @full is the absolute,
  * uncanonicalized guest path (may still contain a leading "/proc").
  * Returns 1 if @full was a /proc path (in which case @result was
  * filled in), 0 if it isn't a /proc path, or a negative errno.
@@ -311,6 +450,7 @@ static int rewrite_proc_path(Tracee *tracee, Config *config,
 	pid_t host_pid = 0;
 	bool is_root = false;
 	bool is_self = false;
+	bool is_bare_self = false;
 	const char *leaf = "";
 
 	if (strcmp(full, "/proc") == 0) {
@@ -323,10 +463,11 @@ static int rewrite_proc_path(Tracee *tracee, Config *config,
 		return 0;
 
 	/* An explicit guest binding must win over host /proc mirroring so
-	 * callers can provide a synthetic kernel command line.  Keep the
+	 * callers can provide synthetic kernel boot inputs.  Keep the
 	 * exception narrow: all other non-PID /proc paths still mirror the
 	 * host as before.  */
-	if (strcmp(full, "/proc/cmdline") == 0
+	if ((strcmp(full, "/proc/cmdline") == 0
+	     || strcmp(full, "/proc/bootconfig") == 0)
 	    && tracee->fs->bindings.guest != NULL) {
 		Binding *binding;
 
@@ -359,8 +500,31 @@ static int rewrite_proc_path(Tracee *tracee, Config *config,
 		 * translate.  Still PID-related (e.g. "status"/"stat"
 		 * content patching applies), so not treated as a plain
 		 * mirrored/spoofed "/sys"-like entry.  */
-		strcpy(result, full);
 		is_self = true;
+		is_bare_self = leaf[0] == '\0';
+		if (strcmp(component, "self") == 0) {
+			Tracee *group = get_tracee_by_vpid(config->tgid_vpid);
+			if (group != NULL)
+				host_pid = group->pid;
+		} else {
+			host_pid = tracee->pid;
+		}
+		if (strcmp(component, "self") == 0
+		    && strncmp(leaf, "task/", 5) == 0) {
+			Tracee *group = get_tracee_by_vpid(config->tgid_vpid);
+			int status;
+
+			if (group == NULL)
+				return -ENOENT;
+			host_pid = group->pid;
+			status = rewrite_proc_task_path(tracee, result, &leaf,
+						       &host_pid);
+			if (status < 0)
+				return status;
+			if (status > 0)
+				goto done;
+		}
+		strcpy(result, full);
 		goto done;
 	}
 
@@ -375,10 +539,15 @@ static int rewrite_proc_path(Tracee *tracee, Config *config,
 			return -ENOENT;
 
 		host_pid = target->pid;
-		status = snprintf(result, PATH_MAX, "/proc/%d%s%s",
-				host_pid, leaf[0] != '\0' ? "/" : "", leaf);
-		if (status < 0 || status >= PATH_MAX)
-			return -ENAMETOOLONG;
+		status = rewrite_proc_task_path(tracee, result, &leaf, &host_pid);
+		if (status < 0)
+			return status;
+		if (status == 0) {
+			status = snprintf(result, PATH_MAX, "/proc/%d%s%s",
+					host_pid, leaf[0] != '\0' ? "/" : "", leaf);
+			if (status < 0 || status >= PATH_MAX)
+				return -ENAMETOOLONG;
+		}
 		goto done;
 	}
 
@@ -397,7 +566,7 @@ done:
 	/* Only the bare "/proc/self" or "/proc/thread-self" symlinks
 	 * themselves have a PID-shaped readlink(2) target; anything
 	 * under them (e.g. "/proc/self/fd/3") doesn't.  */
-	config->last_path_is_self = is_self && leaf[0] == '\0';
+	config->last_path_is_self = is_bare_self;
 
 	/* Non-PID "/proc" entries (e.g. "/proc/cpuinfo", "/proc/sys/...",
 	 * "/proc/version") aren't part of PID virtualization proper:
@@ -438,7 +607,6 @@ static int handle_guest_path(Tracee *tracee, Config *config,
 	status = join_paths(2, full, result, user_path);
 	if (status < 0)
 		return 0; /* Let PRoot's own handling deal with the error.  */
-
 	status = rewrite_proc_path(tracee, config, result, full);
 	if (status != 0)
 		return status;
@@ -539,7 +707,20 @@ static int handle_sysenter(Tracee *tracee, Config *config)
 
 	case PR_sched_setaffinity:
 	case PR_sched_getaffinity:
+	case PR_sched_setparam:
+	case PR_sched_getparam:
+	case PR_sched_setscheduler:
+	case PR_sched_getscheduler:
+	case PR_sched_rr_get_interval:
+	case PR_sched_setattr:
+	case PR_sched_getattr:
 		translate_vpid_arg(tracee, SYSARG_1);
+		break;
+
+	case PR_setpriority:
+	case PR_getpriority:
+		if (peek_reg(tracee, CURRENT, SYSARG_1) == PRIO_PROCESS)
+			translate_vpid_arg(tracee, SYSARG_2);
 		break;
 
 	default:
@@ -657,15 +838,18 @@ static void handle_getdents64_exit(Tracee *tracee, Config *config)
 	int fd;
 	word_t buf_addr;
 	int64_t result;
+	TrackedFd *tracked;
 	char *inbuf, *outbuf;
 	size_t total, in_off, out_off;
+	bool changed = false;
 
 	if (peek_reg(tracee, CURRENT, SYSARG_RESULT) == (word_t) -1)
 		return;
 
 	fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
-	if (find_tracked_fd(config, fd) == NULL
-	    || find_tracked_fd(config, fd)->kind != PROC_FD_ROOT)
+	tracked = find_tracked_fd(config, fd);
+	if (tracked == NULL
+	    || (tracked->kind != PROC_FD_ROOT && tracked->kind != PROC_FD_TASK))
 		return;
 
 	result = (int64_t) peek_reg(tracee, CURRENT, SYSARG_RESULT);
@@ -710,6 +894,7 @@ static void handle_getdents64_exit(Tracee *tracee, Config *config)
 			if (target == NULL) {
 				/* Not part of the PRoot process tree:
 				 * filter this entry out entirely.  */
+				changed = true;
 			} else {
 				char new_name[32];
 				size_t new_len;
@@ -720,6 +905,9 @@ static void handle_getdents64_exit(Tracee *tracee, Config *config)
 
 				memcpy(outbuf + out_off, inbuf + in_off, 19);
 				if (new_len + 1 <= avail) {
+					if (new_len != namelen
+					    || memcmp(name, new_name, new_len) != 0)
+						changed = true;
 					memset(outbuf + out_off + 19, 0, avail);
 					memcpy(outbuf + out_off + 19, new_name, new_len);
 				} else {
@@ -736,7 +924,7 @@ static void handle_getdents64_exit(Tracee *tracee, Config *config)
 		in_off += reclen;
 	}
 
-	if (out_off != total) {
+	if (changed || out_off != total) {
 		if (write_data(tracee, buf_addr, outbuf, out_off) == 0)
 			poke_reg(tracee, SYSARG_RESULT, (word_t) out_off);
 	}
@@ -747,13 +935,14 @@ out:
 }
 
 /**
- * Replace, in @buf (of length @len), every whole decimal number that
- * matches a host PID known to PRoot with the equivalent vPID.  The
- * result (which may be shorter than @len, never longer) is stored
- * into @out and its length into @out_len.
+ * Replace host PID tokens in @buf with their vPIDs, and replace
+ * @hidden_parent_pid with 0 when it is nonzero.  The result (which may
+ * be shorter than @len, never longer) is stored in @out and its length
+ * in @out_len.
  */
-static void patch_pid_tokens(Tracee *tracee UNUSED, const char *buf, size_t len,
-			char *out, size_t *out_len)
+static void patch_pid_tokens(Tracee *tracee, pid_t hidden_parent_pid,
+			    const char *buf, size_t len, char *out,
+			    size_t *out_len)
 {
 	size_t i = 0, o = 0;
 
@@ -781,9 +970,12 @@ static void patch_pid_tokens(Tracee *tracee UNUSED, const char *buf, size_t len,
 
 			{
 				pid_t host_pid = (pid_t) strtoul(numbuf, NULL, 10);
-				Tracee *target = (host_pid > 0) ? get_tracee(tracee, host_pid, false) : NULL;
+				Tracee *target;
 
-				if (target != NULL) {
+				if (host_pid > 0 && host_pid == hidden_parent_pid) {
+					out[o++] = '0';
+				} else if (host_pid > 0
+					   && (target = get_tracee(tracee, host_pid, false)) != NULL) {
 					int written = snprintf(out + o, 24, "%" PRIu64, target->vpid);
 					o += (size_t) written;
 				} else {
@@ -800,6 +992,25 @@ static void patch_pid_tokens(Tracee *tracee UNUSED, const char *buf, size_t len,
 	*out_len = o;
 }
 
+static bool get_target_ppid_vpid(Tracee *tracee, pid_t host_pid,
+				 uint64_t *ppid_vpid)
+{
+	Tracee *target = get_tracee(tracee, host_pid, false);
+	Extension *extension;
+	Config *target_config;
+
+	if (target == NULL)
+		return false;
+
+	extension = get_extension(target, pid_virt_callback);
+	if (extension == NULL || extension->config == NULL)
+		return false;
+
+	target_config = (Config *) extension->config;
+	*ppid_vpid = target_config->ppid_vpid;
+	return true;
+}
+
 static void handle_read_exit(Tracee *tracee, Config *config)
 {
 	int fd;
@@ -809,6 +1020,8 @@ static void handle_read_exit(Tracee *tracee, Config *config)
 	word_t requested;
 	char *inbuf, *outbuf;
 	size_t out_len;
+	uint64_t ppid_vpid;
+	pid_t hidden_parent_pid = 0;
 
 	fd = (int) peek_reg(tracee, ORIGINAL, SYSARG_1);
 	tracked = find_tracked_fd(config, fd);
@@ -860,7 +1073,12 @@ static void handle_read_exit(Tracee *tracee, Config *config)
 	if (read_data(tracee, inbuf, buf_addr, (size_t) result) < 0)
 		goto out;
 
-	patch_pid_tokens(tracee, inbuf, (size_t) result, outbuf, &out_len);
+	if (get_target_ppid_vpid(tracee, tracked->host_pid, &ppid_vpid)
+	    && ppid_vpid == 0)
+		hidden_parent_pid = getpid();
+
+	patch_pid_tokens(tracee, hidden_parent_pid, inbuf, (size_t) result,
+			 outbuf, &out_len);
 
 	if (out_len != (size_t) result) {
 		if (write_data(tracee, buf_addr, outbuf, out_len) == 0)
@@ -905,7 +1123,7 @@ static void handle_readlink_exit(Tracee *tracee, Config *config, Sysnum sysnum)
 	if (read_data(tracee, inbuf, buf_addr, (size_t) result) < 0)
 		goto out2;
 
-	patch_pid_tokens(tracee, inbuf, (size_t) result, outbuf, &out_len);
+	patch_pid_tokens(tracee, 0, inbuf, (size_t) result, outbuf, &out_len);
 
 	if (out_len != (size_t) result || memcmp(inbuf, outbuf, out_len) != 0) {
 		if (write_data(tracee, buf_addr, outbuf, out_len) == 0)
@@ -1023,6 +1241,8 @@ static void handle_openat_exit(Tracee *tracee, Config *config)
 
 	if (config->last_path_is_root)
 		kind = PROC_FD_ROOT;
+	else if (strcmp(config->last_path_leaf, "task") == 0)
+		kind = PROC_FD_TASK;
 	else if (strcmp(config->last_path_leaf, "status") == 0)
 		kind = PROC_FD_STATUS;
 	else if (strcmp(config->last_path_leaf, "stat") == 0)
@@ -1292,6 +1512,14 @@ static void handle_sysexit(Tracee *tracee, Config *config)
 		handle_getdents64_exit(tracee, config);
 		break;
 
+	case PR_dup:
+	case PR_dup2:
+	case PR_dup3:
+	case PR_fcntl:
+	case PR_fcntl64:
+		handle_dup_exit(tracee, config, sysnum);
+		break;
+
 	case PR_read:
 		handle_read_exit(tracee, config);
 		break;
@@ -1380,6 +1608,59 @@ static void handle_sysexit(Tracee *tracee, Config *config)
 	}
 }
 
+static bool virtualize_proc_host_path(Tracee *tracee, char host_path[PATH_MAX])
+{
+	const char *pid_start;
+	const char *pid_end;
+	unsigned long long host_pid;
+	Tracee *target;
+	char path[PATH_MAX];
+	int length;
+	int saved_errno;
+	char *parsed_end;
+
+	if (strncmp(host_path, "/proc/", 6) != 0)
+		return false;
+
+	pid_start = host_path + 6;
+	pid_end = pid_start;
+	while (isdigit((unsigned char) *pid_end))
+		pid_end++;
+	if (pid_end == pid_start
+	    || (*pid_end != '/' && *pid_end != '\0'))
+		return false;
+
+	saved_errno = errno;
+	errno = 0;
+	host_pid = strtoull(pid_start, &parsed_end, 10);
+	if (errno == ERANGE || parsed_end != pid_end || host_pid == 0
+	    || host_pid > INT_MAX) {
+		errno = saved_errno;
+		return false;
+	}
+	errno = saved_errno;
+
+	target = get_tracee(tracee, (pid_t) host_pid, false);
+	if (target == NULL || target->vpid == 0)
+		return false;
+
+	length = snprintf(path, sizeof(path), "/proc/%" PRIu64 "%s",
+			  target->vpid, pid_end);
+	if (length < 0 || (size_t) length >= sizeof(path))
+		return false;
+
+	strcpy(host_path, path);
+	return true;
+}
+
+static void virtualize_proc_fd_target(Tracee *tracee,
+		struct readlink_proc_fd_state *state)
+{
+	if (!state->substituted)
+		state->substituted = virtualize_proc_host_path(tracee,
+							       state->host_path);
+}
+
 int pid_virt_callback(Extension *extension, ExtensionEvent event,
 		intptr_t data1, intptr_t data2)
 {
@@ -1443,6 +1724,15 @@ int pid_virt_callback(Extension *extension, ExtensionEvent event,
 		Config *config = talloc_get_type_abort(extension->config, Config);
 		return handle_guest_path(tracee, config, (char *) data1, (const char *) data2);
 	}
+
+	case PROC_DIRFD_PATH:
+		(void) virtualize_proc_host_path(TRACEE(extension), (char *) data1);
+		return 0;
+
+	case READLINK_PROC_FD:
+		virtualize_proc_fd_target(TRACEE(extension),
+			(struct readlink_proc_fd_state *) data1);
+		return 0;
 
 	case SYSCALL_ENTER_START: {
 		Tracee *tracee = TRACEE(extension);
